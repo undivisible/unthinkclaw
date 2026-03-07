@@ -68,6 +68,16 @@ impl Gateway {
             // Tool endpoints
             .route("/api/tools", get(Self::handle_tools))
             .route("/api/tools/:tool_name/execute", post(Self::handle_tool_execute))
+            // Swarm endpoints
+            .route("/api/swarm/tasks", get(Self::handle_swarm_tasks))
+            .route("/api/swarm/tasks", post(Self::handle_swarm_enqueue))
+            .route("/api/swarm/tasks/:task_id", get(Self::handle_swarm_task_status))
+            .route("/api/swarm/workers", get(Self::handle_swarm_workers))
+            .route("/api/swarm/status", get(Self::handle_swarm_status))
+            // Plugin endpoints
+            .route("/api/plugins", get(Self::handle_plugins_list))
+            .route("/api/plugins/:plugin_name", get(Self::handle_plugin_info))
+            .route("/api/plugins/:plugin_name/call/:method", post(Self::handle_plugin_call))
             .with_state(self.clone())
     }
 
@@ -192,6 +202,91 @@ impl Gateway {
             Json(serde_json::json!({
                 "tool": tool_name,
                 "output": "Tool execution result"
+            })),
+        )
+    }
+
+    // Swarm endpoints
+    async fn handle_swarm_tasks(
+        State(_gateway): State<Gateway>,
+    ) -> Json<Vec<serde_json::Value>> {
+        Json(vec![])
+    }
+
+    async fn handle_swarm_enqueue(
+        State(_gateway): State<Gateway>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let goal = payload.get("goal").and_then(|v| v.as_str()).unwrap_or("untitled");
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "task_id": uuid::Uuid::new_v4().to_string(),
+                "goal": goal,
+                "status": "pending"
+            })),
+        )
+    }
+
+    async fn handle_swarm_task_status(
+        State(_gateway): State<Gateway>,
+        Path(task_id): Path<String>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "status": "pending",
+            "progress": 0
+        }))
+    }
+
+    async fn handle_swarm_workers(
+        State(_gateway): State<Gateway>,
+    ) -> Json<Vec<serde_json::Value>> {
+        Json(vec![])
+    }
+
+    async fn handle_swarm_status(
+        State(_gateway): State<Gateway>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "total_workers": 0,
+            "idle_workers": 0,
+            "total_tasks": 0,
+            "pending_tasks": 0,
+            "completed_tasks": 0
+        }))
+    }
+
+    // Plugin endpoints
+    async fn handle_plugins_list(
+        State(_gateway): State<Gateway>,
+    ) -> Json<Vec<String>> {
+        Json(vec!["ai".to_string(), "tools".to_string(), "vibemania".to_string(), "git".to_string()])
+    }
+
+    async fn handle_plugin_info(
+        State(_gateway): State<Gateway>,
+        Path(plugin_name): Path<String>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "name": plugin_name,
+            "version": "0.1.0",
+            "methods": []
+        }))
+    }
+
+    async fn handle_plugin_call(
+        State(_gateway): State<Gateway>,
+        Path((plugin_name, method)): Path<(String, String)>,
+        Json(params): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "plugin": plugin_name,
+                "method": method,
+                "params": params,
+                "result": "Plugin call result"
             })),
         )
     }

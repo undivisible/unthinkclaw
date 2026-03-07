@@ -13,10 +13,13 @@
 
 pub mod agent;
 pub mod channels;
+pub mod claw_adapter;
 pub mod config;
 pub mod embeddings;
 pub mod gateway;
 pub mod memory;
+pub mod plugin;
 pub mod providers;
 pub mod runtime;
+pub mod swarm;
 pub mod tools;
