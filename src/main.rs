@@ -7,13 +7,18 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 use aclaw::agent::AgentRunner;
+#[cfg(feature = "channel-cli")]
 use aclaw::channels::cli::CliChannel;
+#[cfg(feature = "channel-telegram")]
 use aclaw::channels::telegram::TelegramChannel;
+#[cfg(feature = "channel-discord")]
 use aclaw::channels::discord::DiscordChannel;
 use aclaw::config::Config;
 use aclaw::gateway;
 use aclaw::memory::sqlite::SqliteMemory;
+#[cfg(feature = "provider-anthropic")]
 use aclaw::providers::anthropic::AnthropicProvider;
+#[cfg(feature = "provider-ollama")]
 use aclaw::providers::ollama::OllamaProvider;
 use aclaw::providers::openai_compat::OpenAiCompatProvider;
 use aclaw::providers::Provider;
@@ -142,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
             let runner = AgentRunner::new(provider, tools, memory, &cfg.system_prompt, model);
 
             match channel.as_str() {
+                #[cfg(feature = "channel-cli")]
                 "cli" => {
                     println!("🚀 aclaw — {} via {}", cfg.model, cfg.provider.name);
                     println!("   Workspace: {}", workspace.display());
@@ -151,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
                     let mut ch = CliChannel::new();
                     runner.run(&mut ch).await?;
                 }
+                #[cfg(feature = "channel-telegram")]
                 "telegram" => {
                     let token = telegram_token.ok_or_else(|| anyhow::anyhow!("--telegram-token required"))?;
                     let chat_id = telegram_chat_id.ok_or_else(|| anyhow::anyhow!("--telegram-chat-id required"))?;
@@ -162,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                     let mut ch = TelegramChannel::new(token, chat_id);
                     runner.run(&mut ch).await?;
                 }
+                #[cfg(feature = "channel-discord")]
                 "discord" => {
                     let token = discord_token.ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
                     let channel_id =
@@ -230,16 +238,24 @@ fn load_config(path: &str) -> Config {
         } else if let Ok(token) = resolve_openclaw_token("anthropic") {
             cfg.provider.api_key = Some(token);
             cfg.model = "claude-sonnet-4-5".to_string(); // OAuth-compatible model
-        } else if let Ok(provider) = AnthropicProvider::from_env_or_oauth() {
-            // Fallback to Claude.dev credentials file
-            let _ = provider; // Just checking it exists
-            if let Ok((token, _, _)) = aclaw::providers::oauth::load_oauth_token_from_file() {
-                cfg.provider.api_key = Some(token);
-                cfg.model = "claude-sonnet-4-5".to_string();
+        } 
+        #[cfg(feature = "provider-anthropic")]
+        {
+            if let Ok(_provider) = aclaw::providers::anthropic::AnthropicProvider::from_env_or_oauth() {
+                // Fallback to Claude.dev credentials file
+                let _ = _provider; // Just checking it exists
+                if let Ok((token, _, _)) = aclaw::providers::oauth::load_oauth_token_from_file() {
+                    cfg.provider.api_key = Some(token);
+                    cfg.model = "claude-sonnet-4-5".to_string();
+                }
             }
-        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            cfg.provider.name = "openai".to_string();
-            cfg.provider.api_key = Some(key);
+        }
+        
+        if cfg.provider.api_key.is_none() {
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                cfg.provider.name = "openai".to_string();
+                cfg.provider.api_key = Some(key);
+            }
         }
         cfg
     })
@@ -305,6 +321,7 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
     let api_key = cfg.provider.api_key.clone().unwrap_or_default();
 
     match cfg.provider.name.as_str() {
+        #[cfg(feature = "provider-anthropic")]
         "anthropic" | "claude" => {
             let mut p = AnthropicProvider::new(&api_key);
             if let Some(url) = &cfg.provider.base_url {
@@ -312,6 +329,7 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
             }
             Arc::new(p)
         }
+        #[cfg(feature = "provider-copilot")]
         "github-copilot" | "copilot" => {
             if let Ok(p) = aclaw::providers::copilot::CopilotProvider::from_openclaw() {
                 Arc::new(p)
@@ -319,6 +337,12 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
                 Arc::new(aclaw::providers::copilot::CopilotProvider::new(&api_key))
             }
         }
+        #[cfg(feature = "provider-ollama")]
+        "ollama" => {
+            let url = cfg.provider.base_url.clone().unwrap_or_else(|| "http://localhost:11434".into());
+            Arc::new(OllamaProvider::new(url))
+        }
+        // All OpenAI-compatible providers (always available)
         "openai" => Arc::new(OpenAiCompatProvider::openai(&api_key)),
         "openrouter" => Arc::new(OpenAiCompatProvider::openrouter(&api_key)),
         "groq" => Arc::new(OpenAiCompatProvider::groq(&api_key)),
@@ -335,10 +359,6 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
         "cerebras" => Arc::new(OpenAiCompatProvider::cerebras(&api_key)),
         "minimax" => Arc::new(OpenAiCompatProvider::minimax(&api_key)),
         "vercel" => Arc::new(OpenAiCompatProvider::vercel(&api_key)),
-        "ollama" => {
-            let url = cfg.provider.base_url.clone().unwrap_or_else(|| "http://localhost:11434".into());
-            Arc::new(OllamaProvider::new(url))
-        }
         other => {
             let base = cfg.provider.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".into());
             Arc::new(OpenAiCompatProvider::new(&api_key, base, other))
