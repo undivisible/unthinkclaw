@@ -8,6 +8,8 @@ use clap::{Parser, Subcommand};
 
 use aclaw::agent::AgentRunner;
 use aclaw::channels::cli::CliChannel;
+use aclaw::channels::telegram::TelegramChannel;
+use aclaw::channels::discord::DiscordChannel;
 use aclaw::config::Config;
 use aclaw::gateway;
 use aclaw::memory::sqlite::SqliteMemory;
@@ -41,6 +43,26 @@ enum Commands {
         /// Workspace directory
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+
+        /// Channel: cli, telegram, discord
+        #[arg(long, default_value = "cli")]
+        channel: String,
+
+        /// Telegram bot token (required for --channel telegram)
+        #[arg(long)]
+        telegram_token: Option<String>,
+
+        /// Telegram chat ID (required for --channel telegram)
+        #[arg(long)]
+        telegram_chat_id: Option<i64>,
+
+        /// Discord bot token (required for --channel discord)
+        #[arg(long)]
+        discord_token: Option<String>,
+
+        /// Discord channel ID (required for --channel discord)
+        #[arg(long)]
+        discord_channel_id: Option<String>,
     },
 
     /// Send a one-shot message
@@ -92,7 +114,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat { config, model, workspace } => {
+        Commands::Chat {
+            config,
+            model,
+            workspace,
+            channel,
+            telegram_token,
+            telegram_chat_id,
+            discord_token,
+            discord_channel_id,
+        } => {
             let cfg = load_config(&config);
             let model = model.unwrap_or(cfg.model.clone());
             let workspace = workspace.unwrap_or(cfg.workspace.clone());
@@ -110,12 +141,43 @@ async fn main() -> anyhow::Result<()> {
 
             let runner = AgentRunner::new(provider, tools, memory, &cfg.system_prompt, model);
 
-            println!("🚀 aclaw — {} via {}", cfg.model, cfg.provider.name);
-            println!("   Workspace: {}", workspace.display());
-            println!("   Type /quit to exit\n");
+            match channel.as_str() {
+                "cli" => {
+                    println!("🚀 aclaw — {} via {}", cfg.model, cfg.provider.name);
+                    println!("   Workspace: {}", workspace.display());
+                    println!("   Channel: CLI");
+                    println!("   Type /quit to exit\n");
 
-            let mut channel = CliChannel::new();
-            runner.run(&mut channel).await?;
+                    let mut ch = CliChannel::new();
+                    runner.run(&mut ch).await?;
+                }
+                "telegram" => {
+                    let token = telegram_token.ok_or_else(|| anyhow::anyhow!("--telegram-token required"))?;
+                    let chat_id = telegram_chat_id.ok_or_else(|| anyhow::anyhow!("--telegram-chat-id required"))?;
+
+                    println!("🚀 aclaw — {} via Telegram", cfg.model);
+                    println!("   Chat ID: {}", chat_id);
+                    println!("   Listening for messages...");
+
+                    let mut ch = TelegramChannel::new(token, chat_id);
+                    runner.run(&mut ch).await?;
+                }
+                "discord" => {
+                    let token = discord_token.ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
+                    let channel_id =
+                        discord_channel_id.ok_or_else(|| anyhow::anyhow!("--discord-channel-id required"))?;
+
+                    println!("🚀 aclaw — {} via Discord", cfg.model);
+                    println!("   Channel ID: {}", channel_id);
+                    println!("   Listening for messages...");
+
+                    let mut ch = DiscordChannel::new(token, channel_id);
+                    runner.run(&mut ch).await?;
+                }
+                other => {
+                    anyhow::bail!("Unknown channel: {} (supported: cli, telegram, discord)", other);
+                }
+            }
         }
 
         Commands::Ask { message, config, model } => {
