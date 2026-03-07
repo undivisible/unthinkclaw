@@ -49,7 +49,10 @@ impl Provider for AnthropicProvider {
     }
 
     async fn chat(&self, request: &ChatRequest) -> anyhow::Result<ChatResponse> {
-        let client = reqwest::Client::new();
+        // Create client with 30s socket timeout (security: prevent hanging connections)
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
 
         // Split system message from conversation
         let system = request.messages.iter()

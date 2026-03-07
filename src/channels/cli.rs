@@ -24,8 +24,8 @@ impl Channel for CliChannel {
             let reader = BufReader::new(stdin);
             let mut lines = reader.lines();
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim().to_string();
+            while let Ok(Some(line_input)) = lines.next_line().await {
+                let line = line_input.trim().to_string();
                 if line.is_empty() { continue; }
                 if line == "/quit" || line == "/exit" { break; }
 

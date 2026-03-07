@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::PathBuf;
-use tokio::process::Command;
 
 use super::traits::*;
 
@@ -52,7 +51,7 @@ impl Tool for ShellTool {
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
         let args: ShellArgs = serde_json::from_str(arguments)?;
 
-        let output = Command::new("bash")
+        let output = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&args.command)
             .current_dir(&self.workspace)
