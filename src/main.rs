@@ -220,15 +220,85 @@ fn load_config(path: &str) -> Config {
     Config::load(path).unwrap_or_else(|_| {
         tracing::warn!("Config not found at {}, using defaults", path);
         let mut cfg = Config::default_config();
-        // Try env vars
+        // Try env vars first, then OpenClaw auth-profiles, then Claude.dev credentials
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            cfg.provider.api_key = Some(key);
+            cfg.provider.api_key = Some(key.clone());
+            // OAuth tokens need compatible model names
+            if key.contains("sk-ant-oat") {
+                cfg.model = "claude-sonnet-4-5".to_string();
+            }
+        } else if let Ok(token) = resolve_openclaw_token("anthropic") {
+            cfg.provider.api_key = Some(token);
+            cfg.model = "claude-sonnet-4-5".to_string(); // OAuth-compatible model
+        } else if let Ok(provider) = AnthropicProvider::from_env_or_oauth() {
+            // Fallback to Claude.dev credentials file
+            let _ = provider; // Just checking it exists
+            if let Ok((token, _, _)) = aclaw::providers::oauth::load_oauth_token_from_file() {
+                cfg.provider.api_key = Some(token);
+                cfg.model = "claude-sonnet-4-5".to_string();
+            }
         } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             cfg.provider.name = "openai".to_string();
             cfg.provider.api_key = Some(key);
         }
         cfg
     })
+}
+
+/// Resolve token from OpenClaw's auth-profiles.json
+fn resolve_openclaw_token(provider: &str) -> anyhow::Result<String> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home dir"))?;
+    let auth_path = home.join(".openclaw/agents/main/agent/auth-profiles.json");
+    
+    if !auth_path.exists() {
+        return Err(anyhow::anyhow!("No auth-profiles.json found"));
+    }
+    
+    let content = std::fs::read_to_string(&auth_path)?;
+    let data: serde_json::Value = serde_json::from_str(&content)?;
+    
+    // Try provider:default first
+    let profile_key = format!("{}:default", provider);
+    if let Some(profile) = data["profiles"][&profile_key].as_object() {
+        // Check for token field (OAuth/token type)
+        if let Some(token) = profile.get("token").and_then(|t| t.as_str()) {
+            if !token.is_empty() {
+                tracing::info!("Loaded {} token from OpenClaw auth-profiles", provider);
+                return Ok(token.to_string());
+            }
+        }
+        // Check for key field (API key type)
+        if let Some(key) = profile.get("key").and_then(|k| k.as_str()) {
+            if !key.is_empty() {
+                tracing::info!("Loaded {} API key from OpenClaw auth-profiles", provider);
+                return Ok(key.to_string());
+            }
+        }
+    }
+    
+    // Try any profile for this provider
+    if let Some(profiles) = data["profiles"].as_object() {
+        for (key, value) in profiles {
+            if let Some(p) = value["provider"].as_str() {
+                if p == provider {
+                    if let Some(token) = value["token"].as_str() {
+                        if !token.is_empty() {
+                            tracing::info!("Loaded {} token from OpenClaw profile {}", provider, key);
+                            return Ok(token.to_string());
+                        }
+                    }
+                    if let Some(key_val) = value["key"].as_str() {
+                        if !key_val.is_empty() {
+                            tracing::info!("Loaded {} key from OpenClaw profile {}", provider, key);
+                            return Ok(key_val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("No {} credentials in auth-profiles", provider))
 }
 
 fn build_provider(cfg: &Config) -> Arc<dyn Provider> {

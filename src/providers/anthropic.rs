@@ -1,4 +1,5 @@
 //! Anthropic (Claude) provider implementation.
+//! Supports both API keys and OAuth tokens (Claude.dev)
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -17,6 +18,23 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
         }
+    }
+
+    /// Create from OAuth token (Claude.dev) or fallback to environment/file
+    pub fn from_env_or_oauth() -> anyhow::Result<Self> {
+        // Try standard API key first
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            return Ok(Self::new(key));
+        }
+
+        // Try loading from Claude.dev OAuth credentials
+        if let Ok((token, _, _)) = super::oauth::load_oauth_token_from_file() {
+            return Ok(Self::new(token));
+        }
+
+        Err(anyhow::anyhow!(
+            "No ANTHROPIC_API_KEY found. Set env var or install Claude for Desktop with OAuth token."
+        ))
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -49,9 +67,9 @@ impl Provider for AnthropicProvider {
     }
 
     async fn chat(&self, request: &ChatRequest) -> anyhow::Result<ChatResponse> {
-        // Create client with 30s socket timeout (security: prevent hanging connections)
+        // Create client with 120s socket timeout (LLM calls can be slow)
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(120))
             .build()?;
 
         // Split system message from conversation
@@ -81,11 +99,28 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let resp = client
+        // Detect OAuth tokens (sk-ant-oat) vs API keys (sk-ant-api)
+        // OAuth tokens use Authorization: Bearer header
+        // API keys use x-api-key header
+        let is_oauth = self.api_key.contains("sk-ant-oat");
+
+        let mut req_builder = client
             .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+
+        if is_oauth {
+            // OAuth token: use Bearer auth + required beta headers
+            req_builder = req_builder
+                .header("Authorization", format!("Bearer {}", &self.api_key))
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14");
+        } else {
+            // Standard API key
+            req_builder = req_builder
+                .header("x-api-key", &self.api_key);
+        }
+
+        let resp = req_builder
             .json(&body)
             .send()
             .await?;
