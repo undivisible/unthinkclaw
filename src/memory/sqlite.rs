@@ -12,6 +12,10 @@ pub struct SqliteMemory {
 
 impl SqliteMemory {
     pub fn new(path: &str) -> anyhow::Result<Self> {
+        // Create parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memories (

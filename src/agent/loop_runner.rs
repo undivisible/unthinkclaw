@@ -1,11 +1,15 @@
 //! Agent loop — the core execution engine.
 //! Processes incoming messages, calls LLM, executes tools, sends responses.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use tokio::sync::mpsc;
 
 use crate::channels::{Channel, IncomingMessage, OutgoingMessage};
 use crate::memory::MemoryBackend;
 use crate::providers::{ChatMessage, ChatRequest, Provider};
+use crate::skills;
 use crate::tools::Tool;
 
 const MAX_TOOL_ROUNDS: usize = 10;
@@ -16,6 +20,8 @@ pub struct AgentRunner {
     memory: Arc<dyn MemoryBackend>,
     system_prompt: String,
     model: String,
+    workspace: PathBuf,
+    skills: Vec<skills::Skill>,
 }
 
 impl AgentRunner {
@@ -32,7 +38,21 @@ impl AgentRunner {
             memory,
             system_prompt: system_prompt.into(),
             model: model.into(),
+            workspace: PathBuf::from("."),
+            skills: Vec::new(),
         }
+    }
+
+    /// Set the workspace path (for skill matching).
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Set discovered skills.
+    pub fn with_skills(mut self, skills: Vec<skills::Skill>) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Run the agent loop on a channel.
@@ -65,10 +85,69 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// Run the agent loop with an additional message source (e.g., heartbeat).
+    /// Messages from both the channel and the extra source are processed.
+    pub async fn run_with_extra_rx(
+        &self,
+        channel: &mut dyn Channel,
+        mut extra_rx: mpsc::Receiver<IncomingMessage>,
+    ) -> anyhow::Result<()> {
+        let mut rx = channel.start().await?;
+
+        tracing::info!("Agent started on channel: {} (with heartbeat)", channel.name());
+
+        loop {
+            let msg = tokio::select! {
+                Some(msg) = rx.recv() => msg,
+                Some(msg) = extra_rx.recv() => msg,
+                else => break,
+            };
+
+            match self.handle_message(&msg).await {
+                Ok(response) => {
+                    // Don't send heartbeat responses back to channel if it's a heartbeat message
+                    if msg.sender_id == "system" && response.contains("HEARTBEAT_OK") {
+                        tracing::debug!("Heartbeat: agent responded OK, skipping output");
+                        continue;
+                    }
+                    channel.send(OutgoingMessage {
+                        chat_id: msg.chat_id.clone(),
+                        text: response,
+                        reply_to: Some(msg.id.clone()),
+                    }).await?;
+                }
+                Err(e) => {
+                    tracing::error!("Error handling message: {}", e);
+                    if msg.sender_id != "system" {
+                        channel.send(OutgoingMessage {
+                            chat_id: msg.chat_id,
+                            text: format!("Error: {}", e),
+                            reply_to: Some(msg.id),
+                        }).await?;
+                    }
+                }
+            }
+        }
+
+        channel.stop().await?;
+        Ok(())
+    }
+
     /// Handle a single message — LLM call with tool loop.
     async fn handle_message(&self, msg: &IncomingMessage) -> anyhow::Result<String> {
         // Build conversation with system prompt + memory context
         let mut messages = vec![ChatMessage::system(&self.system_prompt)];
+
+        // Skill injection: check if user message matches a skill
+        if let Some(skill) = skills::match_skill(&self.skills, &msg.text) {
+            if let Some(content) = skills::load_skill_content(skill) {
+                messages.push(ChatMessage::system(format!(
+                    "# Active Skill: {}\n{}\n\nFollow the instructions above for this skill.",
+                    skill.name, content
+                )));
+                tracing::info!("Skill matched: {}", skill.name);
+            }
+        }
 
         // Add memory context if available
         if let Ok(memories) = self.memory.search("chat", &msg.text, 5).await {

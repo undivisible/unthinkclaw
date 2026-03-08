@@ -3,5 +3,6 @@
 
 pub mod traits;
 pub mod sqlite;
+pub mod search;
 
 pub use traits::MemoryBackend;

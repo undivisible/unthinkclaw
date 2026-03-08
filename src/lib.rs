@@ -20,13 +20,17 @@ pub mod channels;
 pub mod claw_adapter;
 pub mod config;
 pub mod cost;
+pub mod cron_scheduler;
 pub mod embeddings;
 pub mod gateway;
+pub mod heartbeat;
 pub mod memory;
 pub mod plugin;
+pub mod prompt;
 pub mod providers;
 pub mod runtime;
 pub mod scheduler;
+pub mod skills;
 pub mod swarm;
 pub mod tools;
 

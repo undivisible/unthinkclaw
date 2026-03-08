@@ -13,9 +13,14 @@ use unthinkclaw::channels::cli::CliChannel;
 use unthinkclaw::channels::telegram::TelegramChannel;
 #[cfg(feature = "channel-discord")]
 use unthinkclaw::channels::discord::DiscordChannel;
+use unthinkclaw::channels::IncomingMessage;
 use unthinkclaw::config::Config;
 use unthinkclaw::gateway;
+use unthinkclaw::heartbeat::{self, HeartbeatConfig};
 use unthinkclaw::memory::sqlite::SqliteMemory;
+use unthinkclaw::memory::search;
+use unthinkclaw::prompt;
+use unthinkclaw::skills;
 #[cfg(feature = "provider-anthropic")]
 use unthinkclaw::providers::anthropic::AnthropicProvider;
 #[cfg(feature = "provider-ollama")]
@@ -138,13 +143,16 @@ async fn main() -> anyhow::Result<()> {
                 &workspace.join(".unthinkclaw/memory.db").to_string_lossy(),
             )?);
 
+            // Build system prompt from workspace files
+            let system_prompt = prompt::build_system_prompt(&workspace);
+
             let tools: Vec<Arc<dyn Tool>> = vec![
                 Arc::new(ShellTool::new(workspace.clone())),
                 Arc::new(FileReadTool::new(workspace.clone())),
                 Arc::new(FileWriteTool::new(workspace.clone())),
             ];
 
-            let runner = AgentRunner::new(provider, tools, memory, &cfg.system_prompt, model);
+            let runner = AgentRunner::new(provider, tools, memory, &system_prompt, model);
 
             match channel.as_str() {
                 #[cfg(feature = "channel-cli")]
@@ -152,7 +160,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("🚀 unthinkclaw — {} via {}", cfg.model, cfg.provider.name);
                     println!("   Workspace: {}", workspace.display());
                     println!("   Channel: CLI");
+                    println!("   Features: system-prompt, memory-search, heartbeat, skills");
                     println!("   Type /quit to exit\n");
+
+                    // Start heartbeat (will check HEARTBEAT.md periodically)
+                    let heartbeat_cfg = HeartbeatConfig {
+                        workspace: workspace.clone(),
+                        ..Default::default()
+                    };
+                    let (hb_tx, _hb_rx) = tokio::sync::mpsc::channel(10);
+                    let _heartbeat_handle = heartbeat::start_heartbeat(heartbeat_cfg, hb_tx);
 
                     let mut ch = CliChannel::new();
                     runner.run(&mut ch).await?;
