@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::traits::*;
 
@@ -51,12 +52,28 @@ impl Tool for ShellTool {
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
         let args: ShellArgs = serde_json::from_str(arguments)?;
 
-        let output = tokio::process::Command::new("bash")
+        let child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&args.command)
             .current_dir(&self.workspace)
-            .output()
-            .await?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        let output = match tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(ToolResult::error(format!(
+                    "Command timed out after {}s",
+                    self.timeout_secs
+                )));
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -55,6 +55,7 @@ pub struct SwarmManager {
     tasks: Arc<RwLock<Vec<Task>>>,
     workers: Arc<RwLock<Vec<Worker>>>,
     task_tx: mpsc::UnboundedSender<Task>,
+    #[allow(dead_code)]
     task_rx: Arc<RwLock<mpsc::UnboundedReceiver<Task>>>,
 }
 

@@ -103,11 +103,14 @@ impl AgentsConfig {
 }
 
 fn extract_field(content: &str, field: &str) -> String {
+    let bold_key = format!("**{}:**", field);
+    let plain_key = format!("{}:", field);
     for line in content.lines() {
-        if line.contains(&format!("**{}**:", field)) || line.contains(&format!("{}:", field)) {
-            if let Some(value) = line.split(':').nth(1) {
-                return value.trim().to_string();
-            }
+        let after = [bold_key.as_str(), plain_key.as_str()]
+            .iter()
+            .find_map(|key| line.find(key).map(|i| &line[i + key.len()..]));
+        if let Some(value) = after {
+            return value.trim().to_string();
         }
     }
     String::new()

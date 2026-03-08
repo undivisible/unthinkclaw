@@ -1,7 +1,6 @@
 //! OAuth token support for Anthropic
 //! Converts Claude.dev OAuth tokens (oat01) to API calls via token exchange
 
-use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;

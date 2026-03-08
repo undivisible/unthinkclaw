@@ -126,8 +126,8 @@ async fn main() -> anyhow::Result<()> {
             channel,
             telegram_token,
             telegram_chat_id,
-            discord_token,
-            discord_channel_id,
+            discord_token: _discord_token,
+            discord_channel_id: _discord_channel_id,
         } => {
             let cfg = load_config(&config);
             let model = model.unwrap_or(cfg.model.clone());
@@ -171,9 +171,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(feature = "channel-discord")]
                 "discord" => {
-                    let token = discord_token.ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
+                    let token = _discord_token.ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
                     let channel_id =
-                        discord_channel_id.ok_or_else(|| anyhow::anyhow!("--discord-channel-id required"))?;
+                        _discord_channel_id.ok_or_else(|| anyhow::anyhow!("--discord-channel-id required"))?;
 
                     println!("🚀 aclaw — {} via Discord", cfg.model);
                     println!("   Channel ID: {}", channel_id);

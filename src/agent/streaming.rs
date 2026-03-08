@@ -21,7 +21,7 @@ pub type StreamReceiver = mpsc::UnboundedReceiver<StreamChunk>;
 pub type StreamSender = mpsc::UnboundedSender<StreamChunk>;
 
 /// Create a streaming channel
-pub fn stream_channel(id: &str) -> (StreamSender, StreamReceiver) {
+pub fn stream_channel(_id: &str) -> (StreamSender, StreamReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
     (tx, rx)
 }

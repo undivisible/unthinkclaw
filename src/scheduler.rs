@@ -130,7 +130,7 @@ mod tests {
     async fn test_schedule_creation() {
         let scheduler = Scheduler::new();
         
-        let id = scheduler.schedule("0 9 * * MON", "Monday digest", 7).await.unwrap();
+        let id = scheduler.schedule("0 0 9 * * MON *", "Monday digest", 7).await.unwrap();
         assert!(!id.is_empty());
         
         let schedules = scheduler.list().await;
@@ -149,7 +149,7 @@ mod tests {
     async fn test_enable_disable() {
         let scheduler = Scheduler::new();
         
-        let id = scheduler.schedule("0 9 * * *", "daily", 5).await.unwrap();
+        let id = scheduler.schedule("0 0 9 * * * *", "daily", 5).await.unwrap();
         
         scheduler.disable(&id).await.unwrap();
         let schedules = scheduler.list().await;

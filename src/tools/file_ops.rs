@@ -43,8 +43,18 @@ impl Tool for FileReadTool {
         let args: ReadArgs = serde_json::from_str(arguments)?;
         let full_path = self.workspace.join(&args.path);
 
-        // Prevent path traversal
-        if !full_path.starts_with(&self.workspace) {
+        // Canonicalize both paths to resolve symlinks and prevent traversal.
+        // The file must exist for canonicalize to succeed, which also acts as an
+        // existence check before we attempt the read.
+        let canonical_workspace = match self.workspace.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!("Workspace inaccessible: {}", e))),
+        };
+        let canonical_path = match full_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!("Cannot access path '{}': {}", args.path, e))),
+        };
+        if !canonical_path.starts_with(&canonical_workspace) {
             return Ok(ToolResult::error("Path traversal not allowed"));
         }
 
@@ -101,16 +111,29 @@ impl Tool for FileWriteTool {
         let args: WriteArgs = serde_json::from_str(arguments)?;
         let full_path = self.workspace.join(&args.path);
 
-        if !full_path.starts_with(&self.workspace) {
+        // Canonicalize the workspace; for the target path canonicalize the
+        // parent (the file may not exist yet) and reconstruct with the filename.
+        let canonical_workspace = match self.workspace.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!("Workspace inaccessible: {}", e))),
+        };
+        let parent = full_path.parent().unwrap_or(&full_path);
+        // Ensure parent dirs exist before canonicalizing them.
+        tokio::fs::create_dir_all(parent).await?;
+        let canonical_parent = match parent.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!("Cannot access parent directory for '{}': {}", args.path, e))),
+        };
+        let filename = match full_path.file_name() {
+            Some(n) => n,
+            None => return Ok(ToolResult::error("Path has no filename")),
+        };
+        let canonical_path = canonical_parent.join(filename);
+        if !canonical_path.starts_with(&canonical_workspace) {
             return Ok(ToolResult::error("Path traversal not allowed"));
         }
 
-        // Create parent directories
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        match tokio::fs::write(&full_path, &args.content).await {
+        match tokio::fs::write(&canonical_path, &args.content).await {
             Ok(_) => Ok(ToolResult::success(format!("Wrote {} bytes to {}", args.content.len(), args.path))),
             Err(e) => Ok(ToolResult::error(format!("Failed to write: {}", e))),
         }

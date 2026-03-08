@@ -1,8 +1,8 @@
 //! SQLite-backed memory storage.
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::Mutex;
 
 use super::traits::*;
 
@@ -44,7 +44,7 @@ impl SqliteMemory {
 
     /// Store an embedding vector for semantic search
     pub fn store_embedding(&self, namespace: &str, key: &str, vector: &[f32], text: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let vector_bytes: Vec<u8> = vector
             .iter()
             .flat_map(|f| f.to_le_bytes().to_vec())
@@ -59,7 +59,7 @@ impl SqliteMemory {
 
     /// Get embedding for a key
     pub fn recall_embedding(&self, namespace: &str, key: &str) -> anyhow::Result<Option<(Vec<f32>, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT vector, text FROM embeddings WHERE namespace = ?1 AND key = ?2"
         )?;
@@ -87,7 +87,7 @@ impl SqliteMemory {
 #[async_trait]
 impl MemoryBackend for SqliteMemory {
     async fn store(&self, namespace: &str, key: &str, value: &str, metadata: Option<serde_json::Value>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let meta_str = metadata.map(|m| m.to_string());
         conn.execute(
             "INSERT OR REPLACE INTO memories (namespace, key, value, metadata) VALUES (?1, ?2, ?3, ?4)",
@@ -97,7 +97,7 @@ impl MemoryBackend for SqliteMemory {
     }
 
     async fn recall(&self, namespace: &str, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 AND key = ?2"
         )?;
@@ -113,7 +113,7 @@ impl MemoryBackend for SqliteMemory {
     }
 
     async fn search(&self, namespace: &str, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let pattern = format!("%{}%", query);
         let mut stmt = conn.prepare(
             "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 AND (key LIKE ?2 OR value LIKE ?2) ORDER BY created_at DESC LIMIT ?3"
@@ -130,13 +130,13 @@ impl MemoryBackend for SqliteMemory {
     }
 
     async fn forget(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM memories WHERE namespace = ?1 AND key = ?2", rusqlite::params![namespace, key])?;
         Ok(())
     }
 
     async fn list(&self, namespace: &str) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 ORDER BY created_at DESC"
         )?;
