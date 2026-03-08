@@ -11,6 +11,7 @@ use unthinkclaw::agent::AgentRunner;
 use unthinkclaw::channels::cli::CliChannel;
 #[cfg(feature = "channel-telegram")]
 use unthinkclaw::channels::telegram::TelegramChannel;
+use unthinkclaw::channels::Channel as _;
 #[cfg(feature = "channel-discord")]
 use unthinkclaw::channels::discord::DiscordChannel;
 use unthinkclaw::config::Config;
@@ -259,8 +260,32 @@ async fn main() -> anyhow::Result<()> {
                     println!("   Chat ID: {}", chat_id);
                     println!("   Listening for messages...");
 
+                    let tg = TelegramChannel::new(token.clone(), chat_id);
                     let mut ch = TelegramChannel::new(token, chat_id);
-                    runner.run(&mut ch).await?;
+                    let mut rx = ch.start().await?;
+
+                    while let Some(msg) = rx.recv().await {
+                        // Send "thinking..." progress message
+                        let _ = tg.send_typing().await;
+                        let progress_msg_id = tg.send_message("⏳ thinking...").await.unwrap_or(0);
+
+                        // Process message
+                        match runner.handle_message_pub(&msg, None).await {
+                            Ok(response) => {
+                                // Delete progress message
+                                if progress_msg_id > 0 {
+                                    let _ = tg.delete_message(progress_msg_id).await;
+                                }
+                                // Send final response
+                                let _ = tg.send_message(&response).await;
+                            }
+                            Err(e) => {
+                                if progress_msg_id > 0 {
+                                    let _ = tg.edit_message(progress_msg_id, &format!("❌ Error: {}", e)).await;
+                                }
+                            }
+                        }
+                    }
                 }
                 #[cfg(feature = "channel-discord")]
                 "discord" => {
