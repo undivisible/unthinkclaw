@@ -60,6 +60,12 @@ impl SqliteMemory {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(namespace, key, value);
+            CREATE TABLE IF NOT EXISTS sticker_cache (
+                sticker_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                description TEXT,
+                analyzed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE INDEX IF NOT EXISTS idx_memories_ns ON memories(namespace);
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_embeddings_ns ON embeddings(namespace);
@@ -71,6 +77,31 @@ impl SqliteMemory {
 
     pub fn in_memory() -> anyhow::Result<Self> {
         Self::new(":memory:")
+    }
+
+    /// Get cached sticker description by ID (non-trait method)
+    pub fn get_sticker_cache(&self, sticker_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT description FROM sticker_cache WHERE sticker_id = ?1")?;
+        let description = stmt.query_row(rusqlite::params![sticker_id], |row| {
+            row.get::<_, Option<String>>(0)
+        }).ok().flatten();
+        Ok(description)
+    }
+
+    /// Store sticker cache (non-trait method)
+    pub fn store_sticker_cache(
+        &self,
+        sticker_id: &str,
+        file_id: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO sticker_cache (sticker_id, file_id, description) VALUES (?1, ?2, ?3)",
+            rusqlite::params![sticker_id, file_id, description],
+        )?;
+        Ok(())
     }
 
     /// Store an embedding vector for semantic search
@@ -129,71 +160,6 @@ impl SqliteMemory {
             rusqlite::params![chat_id, sender_id, sender_name, role, content],
         )?;
         Ok(())
-    }
-
-    /// Get conversation history
-    pub fn get_conversation_history(&self, chat_id: &str, limit: usize) -> anyhow::Result<Vec<(String, String, String)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT role, content, timestamp FROM conversations WHERE chat_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
-        )?;
-        let entries: Vec<(String, String, String)> = stmt.query_map(rusqlite::params![chat_id, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(entries)
-    }
-
-    /// Store file hash for change detection
-    pub fn store_file_hash(&self, path: &str, hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO files (path, hash) VALUES (?1, ?2)",
-            rusqlite::params![path, hash],
-        )?;
-        Ok(())
-    }
-
-    /// Check if file has changed
-    pub fn check_file_changed(&self, path: &str, hash: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT hash FROM files WHERE path = ?1")?;
-        let result = stmt.query_row(rusqlite::params![path], |row| {
-            let stored_hash: String = row.get(0)?;
-            Ok(stored_hash != hash)
-        }).unwrap_or(true); // File doesn't exist in DB = changed
-        Ok(result)
-    }
-
-    /// Store a code chunk with optional embedding
-    pub fn store_chunk(
-        &self,
-        file_path: &str,
-        start_line: i32,
-        end_line: i32,
-        content: &str,
-        embedding: Option<&[f32]>,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let embedding_bytes = embedding.map(|vec| {
-            vec.iter().flat_map(|f| f.to_le_bytes().to_vec()).collect::<Vec<u8>>()
-        });
-        conn.execute(
-            "INSERT INTO chunks (file_path, start_line, end_line, content, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![file_path, start_line, end_line, content, embedding_bytes],
-        )?;
-        Ok(())
-    }
-
-    /// Full-text search across memories
-    pub fn fts_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String, String)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT namespace, key, value FROM memory_fts WHERE memory_fts MATCH ?1 LIMIT ?2"
-        )?;
-        let entries: Vec<(String, String, String)> = stmt.query_map(rusqlite::params![query, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(entries)
     }
 
     /// Sync memory to FTS index
@@ -301,6 +267,24 @@ impl MemoryBackend for SqliteMemory {
         // Reverse to get chronological order (oldest first)
         history.reverse();
         Ok(history)
+    }
+
+    async fn get_sticker_cache(&self, sticker_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT description FROM sticker_cache WHERE sticker_id = ?1")?;
+        let description = stmt.query_row(rusqlite::params![sticker_id], |row| {
+            row.get::<_, Option<String>>(0)
+        }).ok().flatten();
+        Ok(description)
+    }
+
+    async fn store_sticker_cache(&self, sticker_id: &str, file_id: &str, description: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO sticker_cache (sticker_id, file_id, description) VALUES (?1, ?2, ?3)",
+            rusqlite::params![sticker_id, file_id, description],
+        )?;
+        Ok(())
     }
 }
 

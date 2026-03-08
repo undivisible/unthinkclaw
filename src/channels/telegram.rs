@@ -46,11 +46,42 @@ struct Update {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct Voice {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Audio {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Location {
+    latitude: f64,
+    longitude: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Sticker {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Message {
     message_id: i64,
     chat: Chat,
     text: Option<String>,
     from: Option<User>,
+    voice: Option<Voice>,
+    audio: Option<Audio>,
+    location: Option<Location>,
+    sticker: Option<Sticker>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -226,6 +257,66 @@ impl TelegramChannel {
         format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
     }
 
+    /// Transcribe voice/audio file using faster-whisper
+    async fn transcribe_voice(&self, file_id: &str) -> anyhow::Result<String> {
+        // Get file info from Telegram API
+        let file_info_url = format!(
+            "https://api.telegram.org/bot{}/getFile?file_id={}",
+            self.bot_token, file_id
+        );
+        
+        let resp = self.client.get(&file_info_url).send().await?;
+        let body: Value = resp.json().await?;
+        
+        if body["ok"].as_bool() != Some(true) {
+            return Ok(String::new());
+        }
+        
+        let file_path = body["result"]["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("No file_path in response"))?;
+        
+        // Download the file
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path
+        );
+        
+        let file_resp = self.client.get(&download_url).send().await?;
+        let file_bytes = file_resp.bytes().await?;
+        
+        // Create temp file
+        let temp_path = format!("/tmp/voice_{}.ogg", uuid::Uuid::new_v4());
+        std::fs::write(&temp_path, file_bytes)?;
+        
+        // Call faster-whisper via Python
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                r#"
+import sys
+from faster_whisper import WhisperModel
+model = WhisperModel("tiny", device="cpu", compute_type="int8")
+segments, _ = model.transcribe("{}", language="en")
+text = " ".join([segment.text for segment in segments])
+print(text)
+"#,
+                temp_path
+            ))
+            .output()?;
+        
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_path);
+        
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
     /// Send a message and return its message_id (of the last chunk if split)
     pub async fn send_message(&self, text: &str) -> anyhow::Result<i64> {
         // Sanitize markdown
@@ -355,26 +446,50 @@ impl Channel for TelegramChannel {
                 if let Ok(updates) = ch.get_updates(offset).await {
                     for update in updates {
                         if let Some(msg) = &update.message {
-                            if let Some(text) = &msg.text {
-                                let from = msg.from.as_ref();
-                                let is_group = msg.chat.chat_type.as_deref()
-                                    .map(|t| t == "group" || t == "supergroup")
-                                    .unwrap_or(false);
+                            let from = msg.from.as_ref();
+                            let is_group = msg.chat.chat_type.as_deref()
+                                .map(|t| t == "group" || t == "supergroup")
+                                .unwrap_or(false);
 
-                                let incoming = IncomingMessage {
-                                    id: msg.message_id.to_string(),
-                                    sender_id: from.map(|u| u.id.to_string()).unwrap_or_default(),
-                                    sender_name: from.and_then(|u| {
-                                        u.username.clone().or_else(|| u.first_name.clone())
-                                    }),
-                                    chat_id: msg.chat.id.to_string(),
-                                    text: text.clone(),
-                                    is_group,
-                                    reply_to: None,
-                                    timestamp: chrono::Utc::now(),
-                                };
-                                let _ = tx.send(incoming).await;
+                            // Determine message content based on message type
+                            let text = if let Some(loc) = &msg.location {
+                                // Location: format as coordinates with Google Maps link
+                                format!("📍 Location: {}, {} (https://maps.google.com/?q={},{})", 
+                                    loc.latitude, loc.longitude, loc.latitude, loc.longitude)
+                            } else if let Some(_sticker) = &msg.sticker {
+                                // Sticker: just note it was received
+                                "🎨 Sticker received".to_string()
+                            } else if let Some(voice) = &msg.voice {
+                                // Voice: transcribe with faster-whisper
+                                ch.transcribe_voice(&voice.file_id).await.unwrap_or_default()
+                            } else if let Some(audio) = &msg.audio {
+                                // Audio: transcribe with faster-whisper
+                                ch.transcribe_voice(&audio.file_id).await.unwrap_or_default()
+                            } else if let Some(text_content) = &msg.text {
+                                // Regular text
+                                text_content.clone()
+                            } else {
+                                // Unknown message type, skip
+                                continue;
+                            };
+
+                            if text.is_empty() {
+                                continue;
                             }
+
+                            let incoming = IncomingMessage {
+                                id: msg.message_id.to_string(),
+                                sender_id: from.map(|u| u.id.to_string()).unwrap_or_default(),
+                                sender_name: from.and_then(|u| {
+                                    u.username.clone().or_else(|| u.first_name.clone())
+                                }),
+                                chat_id: msg.chat.id.to_string(),
+                                text,
+                                is_group,
+                                reply_to: None,
+                                timestamp: chrono::Utc::now(),
+                            };
+                            let _ = tx.send(incoming).await;
                         }
                         offset = update.update_id + 1;
                     }

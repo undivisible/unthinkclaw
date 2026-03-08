@@ -35,4 +35,10 @@ pub trait MemoryBackend: Send + Sync {
 
     /// Get recent conversation history (returns role, content pairs)
     async fn get_conversation_history(&self, chat_id: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>>;
+
+    /// Get cached sticker description by ID
+    async fn get_sticker_cache(&self, sticker_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// Store sticker cache (sticker_id → description)
+    async fn store_sticker_cache(&self, sticker_id: &str, file_id: &str, description: &str) -> anyhow::Result<()>;
 }
