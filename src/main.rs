@@ -213,12 +213,14 @@ async fn main() -> anyhow::Result<()> {
 
             // Register tools (including memory search/get)
             let tools: Vec<Arc<dyn Tool>> = vec![
-                Arc::new(ShellTool::new(workspace.clone())),
-                Arc::new(FileReadTool::new(workspace.clone())),
-                Arc::new(FileWriteTool::new(workspace.clone())),
-                Arc::new(MemorySearchTool::new(workspace.clone())),
-                Arc::new(MemoryGetTool::new(workspace.clone())),
-                Arc::new(unthinkclaw::tools::web_search::WebSearchTool::new()),
+                Arc::new(ShellTool::new(workspace.clone())),           // exec
+                Arc::new(FileReadTool::new(workspace.clone())),        // Read
+                Arc::new(FileWriteTool::new(workspace.clone())),       // Write
+                Arc::new(unthinkclaw::tools::edit::EditTool::new(workspace.clone())), // Edit
+                Arc::new(MemorySearchTool::new(workspace.clone())),    // memory_search
+                Arc::new(MemoryGetTool::new(workspace.clone())),       // memory_get
+                Arc::new(unthinkclaw::tools::web_search::WebSearchTool::new()),  // web_search
+                Arc::new(unthinkclaw::tools::web_fetch::WebFetchTool::new()),    // web_fetch
             ];
 
             let runner = AgentRunner::new(provider, tools, memory.clone(), &system_prompt, model)

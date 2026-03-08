@@ -1,10 +1,14 @@
-//! File operations tool — read, write, list files.
+//! File operations tools — Read, Write (matching OpenClaw's API).
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 use super::traits::*;
+
+// ============================================================
+// Read tool — read file contents with optional offset/limit
+// ============================================================
 
 pub struct FileReadTool {
     workspace: PathBuf,
@@ -14,25 +18,54 @@ impl FileReadTool {
     pub fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
+
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        if path.starts_with('/') || path.starts_with('~') {
+            let expanded = if path.starts_with('~') {
+                path.replacen('~', &std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()), 1)
+            } else {
+                path.to_string()
+            };
+            PathBuf::from(expanded)
+        } else {
+            self.workspace.join(path)
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct ReadArgs {
+    #[serde(alias = "file_path")]
     path: String,
+    /// Line number to start reading from (1-indexed)
+    offset: Option<usize>,
+    /// Maximum number of lines to read
+    limit: Option<usize>,
 }
 
 #[async_trait]
 impl Tool for FileReadTool {
-    fn name(&self) -> &str { "file_read" }
+    fn name(&self) -> &str { "Read" }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "file_read".to_string(),
-            description: "Read a file's contents".to_string(),
+            name: "Read".to_string(),
+            description: "Read the contents of a file. Use offset/limit for large files.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to workspace" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative or absolute)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line number to start reading from (1-indexed)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read"
+                    }
                 },
                 "required": ["path"]
             }),
@@ -41,36 +74,49 @@ impl Tool for FileReadTool {
 
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
         let args: ReadArgs = serde_json::from_str(arguments)?;
-        let full_path = self.workspace.join(&args.path);
-
-        // Canonicalize both paths to resolve symlinks and prevent traversal.
-        // The file must exist for canonicalize to succeed, which also acts as an
-        // existence check before we attempt the read.
-        let canonical_workspace = match self.workspace.canonicalize() {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Workspace inaccessible: {}", e))),
-        };
-        let canonical_path = match full_path.canonicalize() {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Cannot access path '{}': {}", args.path, e))),
-        };
-        if !canonical_path.starts_with(&canonical_workspace) {
-            return Ok(ToolResult::error("Path traversal not allowed"));
-        }
+        let full_path = self.resolve_path(&args.path);
 
         match tokio::fs::read_to_string(&full_path).await {
             Ok(content) => {
-                let truncated = if content.len() > 50_000 {
-                    format!("{}...\n[truncated]", &content[..50_000])
+                let lines: Vec<&str> = content.lines().collect();
+                let total_lines = lines.len();
+
+                let offset = args.offset.unwrap_or(1).max(1) - 1; // Convert 1-indexed to 0-indexed
+                let limit = args.limit.unwrap_or(2000);
+
+                let selected: Vec<&str> = lines.iter()
+                    .skip(offset)
+                    .take(limit)
+                    .copied()
+                    .collect();
+
+                let result = selected.join("\n");
+
+                // Truncate if too large
+                let truncated = if result.len() > 50_000 {
+                    format!("{}...\n[truncated at 50KB]", &result[..50_000])
                 } else {
-                    content
+                    result
                 };
-                Ok(ToolResult::success(truncated))
+
+                let remaining = total_lines.saturating_sub(offset + limit);
+                if remaining > 0 {
+                    Ok(ToolResult::success(format!(
+                        "{}\n\n[{} more lines in file. Use offset={} to continue.]",
+                        truncated, remaining, offset + limit + 1
+                    )))
+                } else {
+                    Ok(ToolResult::success(truncated))
+                }
             }
-            Err(e) => Ok(ToolResult::error(format!("Failed to read: {}", e))),
+            Err(e) => Ok(ToolResult::error(format!("Cannot read '{}': {}", args.path, e))),
         }
     }
 }
+
+// ============================================================
+// Write tool — create or overwrite files, auto-create parent dirs
+// ============================================================
 
 pub struct FileWriteTool {
     workspace: PathBuf,
@@ -80,27 +126,47 @@ impl FileWriteTool {
     pub fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
+
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        if path.starts_with('/') || path.starts_with('~') {
+            let expanded = if path.starts_with('~') {
+                path.replacen('~', &std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()), 1)
+            } else {
+                path.to_string()
+            };
+            PathBuf::from(expanded)
+        } else {
+            self.workspace.join(path)
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct WriteArgs {
+    #[serde(alias = "file_path")]
     path: String,
     content: String,
 }
 
 #[async_trait]
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str { "file_write" }
+    fn name(&self) -> &str { "Write" }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "file_write".to_string(),
-            description: "Write content to a file".to_string(),
+            name: "Write".to_string(),
+            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to workspace" },
-                    "content": { "type": "string", "description": "Content to write" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to write (relative or absolute)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file"
+                    }
                 },
                 "required": ["path", "content"]
             }),
@@ -109,32 +175,19 @@ impl Tool for FileWriteTool {
 
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
         let args: WriteArgs = serde_json::from_str(arguments)?;
-        let full_path = self.workspace.join(&args.path);
+        let full_path = self.resolve_path(&args.path);
 
-        // Canonicalize the workspace; for the target path canonicalize the
-        // parent (the file may not exist yet) and reconstruct with the filename.
-        let canonical_workspace = match self.workspace.canonicalize() {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Workspace inaccessible: {}", e))),
-        };
-        let parent = full_path.parent().unwrap_or(&full_path);
-        // Ensure parent dirs exist before canonicalizing them.
-        tokio::fs::create_dir_all(parent).await?;
-        let canonical_parent = match parent.canonicalize() {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Cannot access parent directory for '{}': {}", args.path, e))),
-        };
-        let filename = match full_path.file_name() {
-            Some(n) => n,
-            None => return Ok(ToolResult::error("Path has no filename")),
-        };
-        let canonical_path = canonical_parent.join(filename);
-        if !canonical_path.starts_with(&canonical_workspace) {
-            return Ok(ToolResult::error("Path traversal not allowed"));
+        // Create parent directories
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
 
-        match tokio::fs::write(&canonical_path, &args.content).await {
-            Ok(_) => Ok(ToolResult::success(format!("Wrote {} bytes to {}", args.content.len(), args.path))),
+        match tokio::fs::write(&full_path, &args.content).await {
+            Ok(_) => Ok(ToolResult::success(format!(
+                "Successfully wrote {} bytes to {}",
+                args.content.len(),
+                args.path
+            ))),
             Err(e) => Ok(ToolResult::error(format!("Failed to write: {}", e))),
         }
     }
