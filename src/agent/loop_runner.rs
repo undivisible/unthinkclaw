@@ -173,7 +173,18 @@ impl AgentRunner {
     }
 
     async fn setup_progress(&self, _channel: &dyn Channel) -> mpsc::Sender<ProgressUpdate> {
-        let (tx, _rx) = mpsc::channel(32);
+        let (tx, mut rx) = mpsc::channel(32);
+        
+        // Clone channel for the progress task
+        // Note: This requires Channel to be Clone or use Arc
+        // For now, we'll skip the actual typing indicator until Channel is made Clone-safe
+        tokio::spawn(async move {
+            while let Some(_update) = rx.recv().await {
+                // TODO: Send typing indicator via channel
+                // For now, just drain the channel
+            }
+        });
+        
         tx
     }
 

@@ -100,81 +100,59 @@ struct User {
 
 /// Sanitize Markdown for Telegram's strict parser
 fn sanitize_markdown(text: &str) -> String {
-    let mut result = text.to_string();
+    let mut result = String::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut in_code_block = false;
+    let mut in_table = false;
     
-    // Convert pipe tables to bullet lists
-    if result.contains('|') {
-        let lines: Vec<&str> = result.lines().collect();
-        let mut sanitized_lines = Vec::new();
-        let mut in_table = false;
+    for line in lines {
+        let trimmed = line.trim();
         
-        for line in lines {
-            let trimmed = line.trim();
-            // Detect table rows (have pipes and aren't code)
-            if trimmed.contains('|') && !trimmed.starts_with("```") {
-                if !in_table {
-                    in_table = true;
-                }
-                // Convert row to bullet list
-                let cells: Vec<&str> = trimmed.split('|')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                    
-                // Skip separator rows (contain only - and |)
-                if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ' ')) {
-                    continue;
-                }
-                
-                if !cells.is_empty() {
-                    sanitized_lines.push(format!("• {}", cells.join(" | ")));
-                }
-            } else {
-                if in_table && !trimmed.is_empty() {
-                    in_table = false;
-                }
-                sanitized_lines.push(line.to_string());
+        // Track code blocks
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            // Ensure code blocks have language specifiers
+            if in_code_block && trimmed == "```" {
+                result.push_str("```text\n");
+                continue;
             }
         }
-        result = sanitized_lines.join("\n");
-    }
-    
-    // Ensure code blocks have language specifiers
-    result = result.replace("```\n", "```text\n");
-    
-    // Escape unmatched markdown characters (simple heuristic)
-    // Count * and _ to find unmatched pairs
-    let asterisk_count = result.matches('*').count();
-    let _underscore_count = result.matches('_').count();
-    
-    // If odd count outside code blocks, escape them
-    if asterisk_count % 2 != 0 {
-        // Find and escape unmatched * (skip code blocks)
-        let mut escaped = String::new();
-        let mut in_code = false;
-        let mut in_code_block = false;
         
-        for (i, ch) in result.chars().enumerate() {
-            if ch == '`' {
-                let next_two: String = result.chars().skip(i).take(3).collect();
-                if next_two == "```" {
-                    in_code_block = !in_code_block;
-                } else if !in_code_block {
-                    in_code = !in_code;
-                }
+        // Inside code blocks, pass through unchanged
+        if in_code_block {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+        
+        // Detect table rows (contain pipes, not inside code)
+        if trimmed.contains('|') && !trimmed.is_empty() {
+            let cells: Vec<&str> = trimmed.split('|')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            // Skip separator rows (only dashes/spaces)
+            if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ' ')) {
+                continue;
             }
             
-            if ch == '*' && !in_code && !in_code_block {
-                // Check if it's part of a valid markdown pair
-                // For simplicity, escape if count is odd
-                escaped.push('\\');
+            // Convert to bullet list
+            if !cells.is_empty() {
+                in_table = true;
+                result.push_str(&format!("• {}\n", cells.join(" | ")));
+                continue;
             }
-            escaped.push(ch);
+        } else if in_table && !trimmed.is_empty() {
+            in_table = false;
         }
-        result = escaped;
+        
+        // Pass through other lines unchanged
+        result.push_str(line);
+        result.push('\n');
     }
     
-    result
+    result.trim_end().to_string()
 }
 
 /// Chunk message into pieces under max_len, splitting at paragraph/sentence boundaries
@@ -287,10 +265,10 @@ impl TelegramChannel {
         
         // Create temp file
         let temp_path = format!("/tmp/voice_{}.ogg", uuid::Uuid::new_v4());
-        std::fs::write(&temp_path, file_bytes)?;
+        tokio::fs::write(&temp_path, file_bytes).await?;
         
-        // Call faster-whisper via Python
-        let output = std::process::Command::new("python3")
+        // Call faster-whisper via Python (async)
+        let output = tokio::process::Command::new("python3")
             .arg("-c")
             .arg(format!(
                 r#"
@@ -303,10 +281,11 @@ print(text)
 "#,
                 temp_path
             ))
-            .output()?;
+            .output()
+            .await?;
         
         // Clean up temp file
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = tokio::fs::remove_file(&temp_path).await;
         
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout)

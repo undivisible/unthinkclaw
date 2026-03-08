@@ -1,24 +1,27 @@
-//! SQLite-backed memory storage.
+//! SQLite-backed memory storage — all DB ops offloaded via spawn_blocking.
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::sync::Arc;
 
 use super::traits::*;
 
+#[derive(Clone)]
 pub struct SqliteMemory {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteMemory {
     pub fn new(path: &str) -> anyhow::Result<Self> {
-        // Create parent directories if they don't exist
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memories (
+            "PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            CREATE TABLE IF NOT EXISTS memories (
                 namespace TEXT NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
@@ -72,218 +75,171 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_conv_chat ON conversations(chat_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_path);"
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
         Self::new(":memory:")
     }
+}
 
-    /// Get cached sticker description by ID (non-trait method)
-    pub fn get_sticker_cache(&self, sticker_id: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT description FROM sticker_cache WHERE sticker_id = ?1")?;
-        let description = stmt.query_row(rusqlite::params![sticker_id], |row| {
-            row.get::<_, Option<String>>(0)
-        }).ok().flatten();
-        Ok(description)
-    }
-
-    /// Store sticker cache (non-trait method)
-    pub fn store_sticker_cache(
-        &self,
-        sticker_id: &str,
-        file_id: &str,
-        description: &str,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO sticker_cache (sticker_id, file_id, description) VALUES (?1, ?2, ?3)",
-            rusqlite::params![sticker_id, file_id, description],
-        )?;
-        Ok(())
-    }
-
-    /// Store an embedding vector for semantic search
-    pub fn store_embedding(&self, namespace: &str, key: &str, vector: &[f32], text: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let vector_bytes: Vec<u8> = vector
-            .iter()
-            .flat_map(|f| f.to_le_bytes().to_vec())
-            .collect();
-        
-        conn.execute(
-            "INSERT OR REPLACE INTO embeddings (namespace, key, vector, text) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![namespace, key, vector_bytes, text],
-        )?;
-        Ok(())
-    }
-
-    /// Get embedding for a key
-    pub fn recall_embedding(&self, namespace: &str, key: &str) -> anyhow::Result<Option<(Vec<f32>, String)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT vector, text FROM embeddings WHERE namespace = ?1 AND key = ?2"
-        )?;
-        
-        let result = stmt.query_row(rusqlite::params![namespace, key], |row| {
-            let vector_bytes: Vec<u8> = row.get(0)?;
-            let text: String = row.get(1)?;
-            
-            // Convert bytes back to f32 vector
-            let vector: Vec<f32> = vector_bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    f32::from_le_bytes(arr)
-                })
-                .collect();
-            
-            Ok((vector, text))
-        }).ok();
-        
-        Ok(result)
-    }
-
-    /// Store a conversation message
-    pub fn store_conversation(
-        &self,
-        chat_id: &str,
-        sender_id: Option<&str>,
-        sender_name: Option<&str>,
-        role: &str,
-        content: &str,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO conversations (chat_id, sender_id, sender_name, role, content) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![chat_id, sender_id, sender_name, role, content],
-        )?;
-        Ok(())
-    }
-
-    /// Sync memory to FTS index
-    pub fn sync_fts(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM memory_fts", [])?;
-        conn.execute(
-            "INSERT INTO memory_fts (namespace, key, value) SELECT namespace, key, value FROM memories",
-            [],
-        )?;
-        Ok(())
-    }
+fn parse_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
+    let created_str: String = row.get(3)?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    Ok(MemoryEntry {
+        key: row.get(0)?,
+        value: row.get(1)?,
+        metadata: row.get::<_, Option<String>>(2)?.and_then(|s| serde_json::from_str(&s).ok()),
+        created_at,
+    })
 }
 
 #[async_trait]
 impl MemoryBackend for SqliteMemory {
     async fn store(&self, namespace: &str, key: &str, value: &str, metadata: Option<serde_json::Value>) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let ns = namespace.to_string();
+        let k = key.to_string();
+        let v = value.to_string();
         let meta_str = metadata.map(|m| m.to_string());
-        conn.execute(
-            "INSERT OR REPLACE INTO memories (namespace, key, value, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![namespace, key, value, meta_str],
-        )?;
-        // Sync to FTS index
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_fts (namespace, key, value) VALUES (?1, ?2, ?3)",
-            rusqlite::params![namespace, key, value],
-        )?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT OR REPLACE INTO memories (namespace, key, value, metadata) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![ns, k, v, meta_str],
+            )?;
+            guard.execute(
+                "INSERT OR REPLACE INTO memory_fts (namespace, key, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ns, k, v],
+            )?;
+            Ok(())
+        }).await??;
         Ok(())
     }
 
     async fn recall(&self, namespace: &str, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 AND key = ?2"
-        )?;
-        let result = stmt.query_row(rusqlite::params![namespace, key], |row| {
-            Ok(MemoryEntry {
-                key: row.get(0)?,
-                value: row.get(1)?,
-                metadata: row.get::<_, Option<String>>(2)?.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: chrono::Utc::now(), // Simplified
-            })
-        }).ok();
-        Ok(result)
+        let ns = namespace.to_string();
+        let k = key.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 AND key = ?2"
+            )?;
+            Ok(stmt.query_row(rusqlite::params![ns, k], parse_entry).ok())
+        }).await?
     }
 
     async fn search(&self, namespace: &str, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.lock();
+        let ns = namespace.to_string();
         let pattern = format!("%{}%", query);
-        let mut stmt = conn.prepare(
-            "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 AND (key LIKE ?2 OR value LIKE ?2) ORDER BY created_at DESC LIMIT ?3"
-        )?;
-        let entries = stmt.query_map(rusqlite::params![namespace, pattern, limit], |row| {
-            Ok(MemoryEntry {
-                key: row.get(0)?,
-                value: row.get(1)?,
-                metadata: row.get::<_, Option<String>>(2)?.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: chrono::Utc::now(),
-            })
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(entries)
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT key, value, metadata, created_at FROM memories \
+                 WHERE namespace = ?1 AND (key LIKE ?2 OR value LIKE ?2) \
+                 ORDER BY created_at DESC LIMIT ?3"
+            )?;
+            let entries: Vec<MemoryEntry> = stmt
+                .query_map(rusqlite::params![ns, pattern, limit], parse_entry)?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(entries)
+        }).await?
     }
 
     async fn forget(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM memories WHERE namespace = ?1 AND key = ?2", rusqlite::params![namespace, key])?;
-        conn.execute("DELETE FROM memory_fts WHERE namespace = ?1 AND key = ?2", rusqlite::params![namespace, key])?;
+        let ns = namespace.to_string();
+        let k = key.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = conn.lock();
+            guard.execute("DELETE FROM memories WHERE namespace = ?1 AND key = ?2", rusqlite::params![ns, k])?;
+            guard.execute("DELETE FROM memory_fts WHERE namespace = ?1 AND key = ?2", rusqlite::params![ns, k])?;
+            Ok(())
+        }).await??;
         Ok(())
     }
 
     async fn list(&self, namespace: &str) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 ORDER BY created_at DESC"
-        )?;
-        let entries = stmt.query_map(rusqlite::params![namespace], |row| {
-            Ok(MemoryEntry {
-                key: row.get(0)?,
-                value: row.get(1)?,
-                metadata: row.get::<_, Option<String>>(2)?.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: chrono::Utc::now(),
-            })
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(entries)
+        let ns = namespace.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT key, value, metadata, created_at FROM memories WHERE namespace = ?1 ORDER BY created_at DESC"
+            )?;
+            let entries: Vec<MemoryEntry> = stmt
+                .query_map(rusqlite::params![ns], parse_entry)?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(entries)
+        }).await?
     }
 
     async fn store_conversation(&self, chat_id: &str, sender_id: &str, role: &str, content: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO conversations (chat_id, sender_id, role, content) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![chat_id, sender_id, role, content],
-        )?;
+        let cid = chat_id.to_string();
+        let sid = sender_id.to_string();
+        let r = role.to_string();
+        let c = content.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT INTO conversations (chat_id, sender_id, role, content) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![cid, sid, r, c],
+            )?;
+            Ok(())
+        }).await??;
         Ok(())
     }
 
     async fn get_conversation_history(&self, chat_id: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT role, content FROM conversations WHERE chat_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
-        )?;
-        let mut history: Vec<(String, String)> = stmt.query_map(rusqlite::params![chat_id, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?.filter_map(|r| r.ok()).collect();
-        // Reverse to get chronological order (oldest first)
+        let cid = chat_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        let mut history = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, String)>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT role, content FROM conversations WHERE chat_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+            )?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map(rusqlite::params![cid, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }).await??;
         history.reverse();
         Ok(history)
     }
 
     async fn get_sticker_cache(&self, sticker_id: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT description FROM sticker_cache WHERE sticker_id = ?1")?;
-        let description = stmt.query_row(rusqlite::params![sticker_id], |row| {
-            row.get::<_, Option<String>>(0)
-        }).ok().flatten();
-        Ok(description)
+        let sid = sticker_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare("SELECT description FROM sticker_cache WHERE sticker_id = ?1")?;
+            Ok(stmt.query_row(rusqlite::params![sid], |row| row.get::<_, Option<String>>(0)).ok().flatten())
+        }).await?
     }
 
     async fn store_sticker_cache(&self, sticker_id: &str, file_id: &str, description: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO sticker_cache (sticker_id, file_id, description) VALUES (?1, ?2, ?3)",
-            rusqlite::params![sticker_id, file_id, description],
-        )?;
+        let sid = sticker_id.to_string();
+        let fid = file_id.to_string();
+        let desc = description.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT OR REPLACE INTO sticker_cache (sticker_id, file_id, description) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sid, fid, desc],
+            )?;
+            Ok(())
+        }).await??;
         Ok(())
     }
 }
@@ -309,5 +265,16 @@ mod tests {
         let results = mem.search("test", "favorite", 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "color");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history() {
+        let mem = SqliteMemory::in_memory().unwrap();
+        mem.store_conversation("chat1", "user1", "user", "hello").await.unwrap();
+        mem.store_conversation("chat1", "bot", "assistant", "hi there").await.unwrap();
+        let history = mem.get_conversation_history("chat1", 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0, "user");
+        assert_eq!(history[1].0, "assistant");
     }
 }
