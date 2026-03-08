@@ -16,6 +16,7 @@ pub mod web_search;
 pub mod web_fetch;
 pub mod session;
 pub mod message;
+pub mod dynamic;
 pub mod vibemania;
 
 pub use traits::{Tool, ToolSpec, ToolResult};

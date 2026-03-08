@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Register tools (including memory search/get)
-            let tools: Vec<Arc<dyn Tool>> = vec![
+            let mut tools: Vec<Arc<dyn Tool>> = vec![
                 Arc::new(ShellTool::new(workspace.clone())),           // exec
                 Arc::new(FileReadTool::new(workspace.clone())),        // Read
                 Arc::new(FileWriteTool::new(workspace.clone())),       // Write
@@ -222,7 +222,19 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(unthinkclaw::tools::web_search::WebSearchTool::new()),  // web_search
                 Arc::new(unthinkclaw::tools::web_fetch::WebFetchTool::new()),    // web_fetch
                 Arc::new(unthinkclaw::tools::session::ListModelsTool::new()),    // list_models
+                Arc::new(unthinkclaw::tools::dynamic::CreateToolTool::new()),    // create_tool
+                Arc::new(unthinkclaw::tools::dynamic::ListCustomToolsTool::new()), // list_custom_tools
             ];
+
+            // Load any previously created dynamic tools
+            let dynamic_tools = unthinkclaw::tools::dynamic::DynamicTool::load_all();
+            let dynamic_count = dynamic_tools.len();
+            for dt in dynamic_tools {
+                tools.push(Arc::new(dt));
+            }
+            if dynamic_count > 0 {
+                println!("   Loaded {} custom tool(s)", dynamic_count);
+            }
 
             let mut runner = AgentRunner::new(provider, tools, memory.clone(), &system_prompt, model)
                 .with_workspace(workspace.clone())
