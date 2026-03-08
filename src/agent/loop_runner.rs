@@ -12,7 +12,14 @@ use crate::providers::{ChatMessage, ChatRequest, Provider};
 use crate::skills;
 use crate::tools::Tool;
 
-const MAX_TOOL_ROUNDS: usize = 10;
+/// Circuit breaker: stop after this many rounds to prevent infinite loops.
+/// Unlike a hard limit, the LLM can run as many tools as needed.
+/// We only stop if we detect a stuck loop (same tool+args repeating).
+const CIRCUIT_BREAKER_ROUNDS: usize = 50;
+/// Warn the LLM after this many identical tool calls
+const LOOP_WARN_THRESHOLD: usize = 5;
+/// Hard stop after this many identical consecutive tool calls
+const LOOP_BREAK_THRESHOLD: usize = 10;
 
 pub struct AgentRunner {
     provider: Arc<dyn Provider>,
@@ -169,8 +176,11 @@ impl AgentRunner {
             .map(|t| t.spec())
             .collect();
 
-        // Agent loop: LLM → tool calls → LLM → ... → final text
-        for _round in 0..MAX_TOOL_ROUNDS {
+        // Agent loop: LLM → tool calls → LLM → ... until stop_reason=end_turn
+        // No hard round limit. Loop detection catches stuck patterns.
+        let mut tool_call_history: Vec<String> = Vec::new(); // hash of tool+args
+        for round in 0..CIRCUIT_BREAKER_ROUNDS {
+            tracing::info!("Agent round {} — {} messages", round + 1, messages.len());
             let request = ChatRequest {
                 messages: messages.clone(),
                 tools: if tool_specs.is_empty() { None } else { Some(tool_specs.clone()) },
@@ -183,6 +193,7 @@ impl AgentRunner {
 
             if !response.has_tool_calls() {
                 // No more tool calls — return the text response
+                tracing::info!("Agent done after {} round(s)", round + 1);
                 let text = response.text.unwrap_or_default();
 
                 // Store the interaction in memory
@@ -224,7 +235,31 @@ impl AgentRunner {
                 });
             }
 
+            // Loop detection: hash tool calls and check for repeating patterns
+            for tc in &response.tool_calls {
+                let hash = format!("{}:{}", tc.name, tc.arguments);
+                tool_call_history.push(hash);
+            }
+            // Check for stuck loops
+            if tool_call_history.len() >= LOOP_BREAK_THRESHOLD {
+                let last = &tool_call_history[tool_call_history.len() - 1];
+                let consecutive = tool_call_history.iter().rev().take_while(|h| *h == last).count();
+                if consecutive >= LOOP_BREAK_THRESHOLD {
+                    tracing::warn!("Loop detected: {} identical calls to {}, breaking", consecutive, response.tool_calls[0].name);
+                    return Ok(format!("I got stuck in a loop calling {} {} times. Let me try a different approach — can you rephrase your request?", response.tool_calls[0].name, consecutive));
+                }
+                if consecutive >= LOOP_WARN_THRESHOLD {
+                    // Inject a warning into the conversation
+                    messages.push(ChatMessage::user(format!(
+                        "WARNING: You have called {} {} times with identical arguments. If this is not making progress, stop retrying and give me your best answer with what you have.",
+                        response.tool_calls[0].name, consecutive
+                    )));
+                    tracing::warn!("Loop warning: {} identical calls to {}", consecutive, response.tool_calls[0].name);
+                }
+            }
+
             // Execute each tool call
+            tracing::info!("Tool calls: {}", response.tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>().join(", "));
             for tc in &response.tool_calls {
                 let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == tc.name) {
                     match tool.execute(&tc.arguments).await {
@@ -239,6 +274,7 @@ impl AgentRunner {
             }
         }
 
-        Ok("Reached maximum tool rounds. Please try a simpler request.".to_string())
+        tracing::error!("Circuit breaker: {} rounds without completion", CIRCUIT_BREAKER_ROUNDS);
+        Ok("Hit the circuit breaker — too many tool rounds without finishing. This usually means I'm stuck. Try rephrasing?".to_string())
     }
 }
