@@ -6,10 +6,12 @@ use serde_json::Value;
 
 use super::traits::*;
 use crate::tools::ToolSpec;
+use crate::cost::{CostTracker, TokenUsage};
 
 pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
+    cost_tracker: Option<std::sync::Arc<CostTracker>>,
 }
 
 impl AnthropicProvider {
@@ -17,6 +19,7 @@ impl AnthropicProvider {
         Self {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
+            cost_tracker: None,
         }
     }
 
@@ -39,6 +42,11 @@ impl AnthropicProvider {
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    pub fn with_cost_tracker(mut self, tracker: std::sync::Arc<CostTracker>) -> Self {
+        self.cost_tracker = Some(tracker);
         self
     }
 
@@ -109,6 +117,30 @@ impl AnthropicProvider {
             })
         }).collect()
     }
+
+    /// Extract usage from Anthropic API response and record cost
+    async fn record_usage(&self, data: &Value, model: &str) {
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(usage_obj) = data.get("usage").and_then(|v| v.as_object()) {
+                let input_tokens = usage_obj.get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let output_tokens = usage_obj.get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+
+                let usage = TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens + output_tokens,
+                };
+
+                if let Err(e) = tracker.record(model, usage).await {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -140,8 +172,6 @@ impl Provider for AnthropicProvider {
         };
 
         // Build Anthropic-format messages
-        // Key: tool_result messages must be role "user" with tool_result content blocks
-        // Assistant messages after tool calls need tool_use content blocks
         let messages: Vec<Value> = self.build_anthropic_messages(&request.messages);
 
         let mut body = serde_json::json!({
@@ -162,8 +192,6 @@ impl Provider for AnthropicProvider {
         }
 
         // Detect OAuth tokens (sk-ant-oat) vs API keys (sk-ant-api)
-        // OAuth tokens use Authorization: Bearer header
-        // API keys use x-api-key header
         let is_oauth = self.api_key.contains("sk-ant-oat");
 
         let mut req_builder = client
@@ -172,12 +200,10 @@ impl Provider for AnthropicProvider {
             .header("anthropic-version", "2023-06-01");
 
         if is_oauth {
-            // OAuth token: use Bearer auth + required beta headers
             req_builder = req_builder
                 .header("Authorization", format!("Bearer {}", &self.api_key))
                 .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14");
         } else {
-            // Standard API key
             req_builder = req_builder
                 .header("x-api-key", &self.api_key);
         }
@@ -194,6 +220,9 @@ impl Provider for AnthropicProvider {
         }
 
         let data: Value = resp.json().await?;
+
+        // Record usage for cost tracking
+        self.record_usage(&data, &request.model).await;
 
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();

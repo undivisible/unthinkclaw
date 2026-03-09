@@ -224,6 +224,8 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(unthinkclaw::tools::session::ListModelsTool::new()),    // list_models
                 Arc::new(unthinkclaw::tools::dynamic::CreateToolTool::new()),    // create_tool
                 Arc::new(unthinkclaw::tools::dynamic::ListCustomToolsTool::new()), // list_custom_tools
+                Arc::new(unthinkclaw::tools::browser::BrowserTool::new()),       // browser (agent-browser)
+                Arc::new(unthinkclaw::tools::mcp::McpTool::new()),               // mcp (Codex MCP client)
             ];
 
             // Load any previously created dynamic tools
@@ -315,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
                                         /models — List available models\n\
                                         /tools — List available tools\n\
                                         /status — Bot status\n\
+                                        /cost — API usage & spending\n\
                                         /reset — Clear conversation history\n\n\
                                         Everything else is sent to the AI."
                                     ).await;
@@ -376,6 +379,33 @@ async fn main() -> anyhow::Result<()> {
                                     let _ = tg.send_message("🗑 Conversation history cleared.").await;
                                     continue;
                                 }
+                                "/cost" => {
+                                    let summary = runner.get_cost_summary().await;
+                                    let mut by_model: Vec<_> = summary.by_model.iter().collect();
+                                    by_model.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+                                    
+                                    let model_breakdown = if by_model.is_empty() {
+                                        "No usage yet.".to_string()
+                                    } else {
+                                        by_model.iter()
+                                            .map(|(model, cost)| format!("  • {}: ${:.4}", model, cost))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    };
+                                    
+                                    let _ = tg.send_message(&format!(
+                                        "💰 *Cost Summary:*\n\n\
+                                        Total: ${:.4}\n\
+                                        Tokens: {}\n\
+                                        Calls: {}\n\n\
+                                        By model:\n{}",
+                                        summary.total_cost,
+                                        summary.total_tokens,
+                                        summary.call_count,
+                                        model_breakdown,
+                                    )).await;
+                                    continue;
+                                }
                                 "/start" => {
                                     let _ = tg.send_message(
                                         "🐾 *unthinkclaw* — AI assistant\n\n\
@@ -404,15 +434,28 @@ async fn main() -> anyhow::Result<()> {
                             while let Some(update) = progress_rx.recv().await {
                                 use unthinkclaw::agent::loop_runner::ProgressUpdate;
                                 let status_text = match update {
-                                    ProgressUpdate::Thinking => "⏳".to_string(),
+                                    ProgressUpdate::Thinking => "thinking...".to_string(),
                                     ProgressUpdate::ToolCall { name, round } => {
-                                        format!("🔧 {} ({})", name, round)
+                                        // Descriptive tool names with emoji
+                                        let display = match name.as_str() {
+                                            "exec" => "running shell command",
+                                            "Read" => "reading file",
+                                            "Write" => "writing file",
+                                            "Edit" => "editing file",
+                                            "web_search" => "searching web",
+                                            "web_fetch" => "fetching webpage",
+                                            "memory_search" => "searching memory",
+                                            "browser" => "browsing web",
+                                            "create_tool" => "creating custom tool",
+                                            _ => &name,
+                                        };
+                                        format!("🔧 {} (round {})", display, round)
                                     }
                                     ProgressUpdate::Processing { round, tool_count } => {
                                         if round == 0 || tool_count == 0 {
                                             break;
                                         }
-                                        format!("🤔 round {} ({} tools)", round, tool_count)
+                                        format!("processing... round {} ({} tools)", round, tool_count)
                                     }
                                 };
                                 

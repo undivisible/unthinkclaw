@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::channels::{Channel, IncomingMessage, OutgoingMessage};
+use crate::cost::{CostTracker, TokenUsage};
 use crate::memory::MemoryBackend;
 use crate::providers::{ChatMessage, ChatRequest, Provider};
 use crate::skills;
@@ -43,6 +44,7 @@ pub struct AgentRunner {
     model: std::sync::RwLock<String>,
     workspace: PathBuf,
     skills: Vec<skills::Skill>,
+    cost_tracker: Arc<CostTracker>,
 }
 
 impl AgentRunner {
@@ -61,6 +63,7 @@ impl AgentRunner {
             model: std::sync::RwLock::new(model.into()),
             workspace: PathBuf::from("."),
             skills: Vec::new(),
+            cost_tracker: Arc::new(CostTracker::new()),
         }
     }
 
@@ -72,6 +75,11 @@ impl AgentRunner {
     pub fn with_skills(mut self, skills: Vec<skills::Skill>) -> Self {
         self.skills = skills;
         self
+    }
+
+    /// Get cost summary
+    pub async fn get_cost_summary(&self) -> crate::cost::CostSummary {
+        self.cost_tracker.summary().await
     }
 
     /// Get current model name
@@ -258,6 +266,18 @@ impl AgentRunner {
             };
 
             let response = self.provider.chat(&request).await?;
+
+            // Track cost if usage is available
+            if let Some(usage) = &response.usage {
+                let _ = self.cost_tracker.record(
+                    &self.model.read().unwrap(),
+                    TokenUsage {
+                        input_tokens: usage.input_tokens as usize,
+                        output_tokens: usage.output_tokens as usize,
+                        total_tokens: (usage.input_tokens + usage.output_tokens) as usize,
+                    }
+                ).await;
+            }
 
             if !response.has_tool_calls() {
                 // Done — return text and persist to history

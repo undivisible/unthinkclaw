@@ -24,6 +24,7 @@ pub mod cron_scheduler;
 pub mod embeddings;
 pub mod gateway;
 pub mod heartbeat;
+pub mod mcp;
 pub mod memory;
 pub mod plugin;
 pub mod prompt;

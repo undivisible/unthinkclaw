@@ -18,5 +18,7 @@ pub mod session;
 pub mod message;
 pub mod dynamic;
 pub mod vibemania;
+pub mod browser;
+pub mod mcp;
 
 pub use traits::{Tool, ToolSpec, ToolResult};
