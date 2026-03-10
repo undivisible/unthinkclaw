@@ -129,7 +129,8 @@ pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Sk
     }
 
     // Minimum threshold
-    if best_score >= 2.0 {
+    // Require strong match — 2.0 was too low, matched on noise words
+    if best_score >= 5.0 {
         best_skill
     } else {
         None

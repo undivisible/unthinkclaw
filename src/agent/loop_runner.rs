@@ -318,8 +318,8 @@ impl AgentRunner {
                 messages: messages.clone(),
                 tools: if tool_specs.is_empty() { None } else { Some(tool_specs.clone()) },
                 model: self.model.read().unwrap().clone(),
-                temperature: 0.7,
-                max_tokens: None,
+                temperature: 0.3, // Low temp for reliable tool-calling
+                max_tokens: Some(8192),
             };
 
             let response = self.provider.chat(&request).await?;
