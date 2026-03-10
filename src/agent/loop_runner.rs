@@ -314,11 +314,16 @@ impl AgentRunner {
                 round + 1, messages.len(),
                 messages.iter().map(|m| m.content.len()).sum::<usize>());
 
+            // Adaptive temperature:
+            // - Round 0 (first response): higher temp for natural conversation
+            // - Subsequent rounds (tool loop): low temp for precision
+            let temperature = if round == 0 { 0.7 } else { 0.2 };
+
             let request = ChatRequest {
                 messages: messages.clone(),
                 tools: if tool_specs.is_empty() { None } else { Some(tool_specs.clone()) },
                 model: self.model.read().unwrap().clone(),
-                temperature: 0.3, // Low temp for reliable tool-calling
+                temperature,
                 max_tokens: Some(8192),
             };
 
