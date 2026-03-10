@@ -64,6 +64,18 @@ impl Tool for ShellTool {
 
     async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
         let args: ShellArgs = serde_json::from_str(arguments)?;
+
+        // Guard: prevent self-restart/self-kill mid-conversation
+        let cmd_lower = args.command.to_lowercase();
+        if (cmd_lower.contains("systemctl") && cmd_lower.contains("unthinkclaw"))
+            || (cmd_lower.contains("pkill") && cmd_lower.contains("unthinkclaw"))
+            || (cmd_lower.contains("kill") && cmd_lower.contains("unthinkclaw"))
+        {
+            return Ok(ToolResult::error(
+                "⚠️ Cannot restart/kill yourself mid-conversation. Use /restart command instead."
+            ));
+        }
+
         let timeout = args.timeout.unwrap_or(self.timeout_secs);
 
         let cwd = if let Some(dir) = &args.cwd {
