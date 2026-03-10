@@ -89,6 +89,21 @@ fn parse_skill_frontmatter(content: &str, path: &Path) -> Option<Skill> {
 }
 
 /// Find the best matching skill for a user message
+/// Stopwords — common words that should never contribute to skill matching
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "has", "have", "been", "some", "them",
+    "than", "its", "over", "such", "that", "this", "with", "will", "each",
+    "from", "they", "were", "which", "their", "said", "what", "when", "who",
+    "how", "use", "new", "now", "way", "may", "get", "got", "set", "let",
+    "any", "also", "into", "just", "only", "very", "even", "most", "other",
+    "need", "make", "like", "does", "your", "more", "want", "should",
+];
+
+fn is_stopword(word: &str) -> bool {
+    STOPWORDS.contains(&word)
+}
+
 pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Skill> {
     let msg_lower = user_message.to_lowercase();
     let msg_words: Vec<&str> = msg_lower.split_whitespace().collect();
@@ -101,22 +116,24 @@ pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Sk
         let name_lower = skill.name.to_lowercase();
         let mut score = 0.0f32;
 
-        // Direct name mention
-        if msg_lower.contains(&name_lower) {
+        // Direct name mention (strong signal)
+        if msg_lower.contains(&name_lower) && name_lower.len() >= 4 {
             score += 10.0;
         }
 
-        // Word overlap: message words in description
+        // Word overlap: message words in description (skip stopwords)
         for word in &msg_words {
-            if word.len() < 3 { continue; }
+            if word.len() < 4 { continue; }
+            if is_stopword(word) { continue; }
             if desc_lower.contains(word) {
                 score += 1.0;
             }
         }
 
-        // Word overlap: description words in message
+        // Word overlap: description words in message (skip stopwords)
         for word in desc_lower.split(|c: char| !c.is_alphanumeric()) {
-            if word.len() < 3 { continue; }
+            if word.len() < 4 { continue; }
+            if is_stopword(word) { continue; }
             if msg_lower.contains(word) {
                 score += 1.0;
             }
@@ -128,8 +145,7 @@ pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Sk
         }
     }
 
-    // Minimum threshold
-    // Require strong match — 2.0 was too low, matched on noise words
+    // Require strong match
     if best_score >= 5.0 {
         best_skill
     } else {
