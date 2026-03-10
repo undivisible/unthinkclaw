@@ -8,9 +8,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="/tmp/aclaw.log"
 PIDFILE="/tmp/unthinkclaw.pid"
 
+# Load env from .env file
+if [ -f "$REPO/.env" ]; then
+  source "$REPO/.env"
+fi
+
 # Launch args (mirror production)
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?set TELEGRAM_TOKEN env var}"
-TELEGRAM_CHAT_ID="5708941906"
+TELEGRAM_TOKEN="${UNTHINKCLAW_TELEGRAM_TOKEN:?set UNTHINKCLAW_TELEGRAM_TOKEN in .env}"
+TELEGRAM_CHAT_ID="${UNTHINKCLAW_CHAT_ID:-5708941906}"
 MODEL="${MODEL:-claude-sonnet-4-5}"
 BIN="$REPO/target/release/unthinkclaw"
 
