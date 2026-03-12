@@ -391,6 +391,217 @@ impl MemoryBackend for SqliteMemory {
         }).await??;
         Ok(())
     }
+
+    // ── Embeddings ──
+
+    async fn store_embedding(
+        &self,
+        namespace: &str,
+        key: &str,
+        vector: &[f32],
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let ns = namespace.to_string();
+        let k = key.to_string();
+        let blob: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let t = text.to_string();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = pool.connections[index].lock();
+            guard.execute(
+                "INSERT OR REPLACE INTO embeddings (namespace, key, vector, text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![ns, k, blob, t],
+            )?;
+            Ok(())
+        }).await??;
+        Ok(())
+    }
+
+    async fn search_embeddings(
+        &self,
+        namespace: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<EmbeddingEntry>> {
+        let ns = namespace.to_string();
+        let qv = query_vector.to_vec();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<EmbeddingEntry>> {
+            let guard = pool.connections[index].lock();
+            let mut stmt = guard.prepare(
+                "SELECT namespace, key, vector, text, created_at FROM embeddings WHERE namespace = ?1"
+            )?;
+            let rows: Vec<EmbeddingEntry> = stmt
+                .query_map(rusqlite::params![ns], |row| {
+                    let blob: Vec<u8> = row.get(2)?;
+                    let vector: Vec<f32> = blob
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let created_str: String = row.get(4)?;
+                    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    Ok(EmbeddingEntry {
+                        namespace: row.get(0)?,
+                        key: row.get(1)?,
+                        vector,
+                        text: row.get(3)?,
+                        created_at,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Cosine similarity ranking
+            let mut scored: Vec<(f32, EmbeddingEntry)> = rows
+                .into_iter()
+                .map(|entry| {
+                    let sim = cosine_similarity_sqlite(&qv, &entry.vector);
+                    (sim, entry)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
+            Ok(scored.into_iter().map(|(_, e)| e).collect())
+        }).await?
+    }
+
+    // ── File indexing ──
+
+    async fn store_file_index(&self, path: &str, hash: &str) -> anyhow::Result<()> {
+        let p = path.to_string();
+        let h = hash.to_string();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = pool.connections[index].lock();
+            guard.execute(
+                "INSERT OR REPLACE INTO files (path, hash) VALUES (?1, ?2)",
+                rusqlite::params![p, h],
+            )?;
+            Ok(())
+        }).await??;
+        Ok(())
+    }
+
+    async fn get_file_index(&self, path: &str) -> anyhow::Result<Option<FileIndex>> {
+        let p = path.to_string();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<FileIndex>> {
+            let guard = pool.connections[index].lock();
+            let mut stmt = guard.prepare(
+                "SELECT path, hash, last_indexed FROM files WHERE path = ?1"
+            )?;
+            Ok(stmt
+                .query_row(rusqlite::params![p], |row| {
+                    let created_str: String = row.get(2)?;
+                    let last_indexed = chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    Ok(FileIndex {
+                        path: row.get(0)?,
+                        hash: row.get(1)?,
+                        last_indexed,
+                    })
+                })
+                .ok())
+        }).await?
+    }
+
+    // ── Code chunks ──
+
+    async fn store_chunk(
+        &self,
+        file_path: &str,
+        start_line: u32,
+        end_line: u32,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> anyhow::Result<()> {
+        let fp = file_path.to_string();
+        let c = content.to_string();
+        let blob: Option<Vec<u8>> = embedding.map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect());
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = pool.connections[index].lock();
+            guard.execute(
+                "INSERT INTO chunks (file_path, start_line, end_line, content, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![fp, start_line, end_line, c, blob],
+            )?;
+            Ok(())
+        }).await??;
+        Ok(())
+    }
+
+    async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<Chunk>> {
+        let fp = file_path.to_string();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Chunk>> {
+            let guard = pool.connections[index].lock();
+            let mut stmt = guard.prepare(
+                "SELECT file_path, start_line, end_line, content, embedding, created_at
+                 FROM chunks WHERE file_path = ?1 ORDER BY start_line ASC"
+            )?;
+            let rows: Vec<Chunk> = stmt
+                .query_map(rusqlite::params![fp], |row| {
+                    let blob: Option<Vec<u8>> = row.get(4)?;
+                    let embedding = blob.map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    });
+                    let created_str: String = row.get(5)?;
+                    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    Ok(Chunk {
+                        file_path: row.get(0)?,
+                        start_line: row.get(1)?,
+                        end_line: row.get(2)?,
+                        content: row.get(3)?,
+                        embedding,
+                        created_at,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }).await?
+    }
+
+    async fn delete_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        let fp = file_path.to_string();
+        let pool = Arc::clone(&self.pool);
+        let index = self.connection_index();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = pool.connections[index].lock();
+            guard.execute(
+                "DELETE FROM chunks WHERE file_path = ?1",
+                rusqlite::params![fp],
+            )?;
+            Ok(())
+        }).await??;
+        Ok(())
+    }
+}
+
+fn cosine_similarity_sqlite(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let ma: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if ma == 0.0 || mb == 0.0 {
+        return 0.0;
+    }
+    dot / (ma * mb)
 }
 
 #[cfg(test)]

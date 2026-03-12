@@ -41,6 +41,32 @@ struct StickerRow {
     analyzed_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmbeddingRow {
+    namespace: String,
+    key: String,
+    vector: Vec<f32>,
+    text: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileIndexRow {
+    path: String,
+    hash: String,
+    last_indexed: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChunkRow {
+    file_path: String,
+    start_line: u32,
+    end_line: u32,
+    content: String,
+    embedding: Option<Vec<f32>>,
+    created_at: String,
+}
+
 impl SurrealMemory {
     pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = Surreal::new::<RocksDb>(path.as_ref()).await?;
@@ -79,6 +105,34 @@ const SCHEMA_SQL: &str = r#"
     DEFINE FIELD IF NOT EXISTS description ON sticker_cache TYPE string;
     DEFINE FIELD IF NOT EXISTS analyzed_at ON sticker_cache TYPE string;
     DEFINE INDEX IF NOT EXISTS sticker_id_idx ON sticker_cache FIELDS sticker_id UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS embeddings SCHEMALESS;
+    DEFINE FIELD IF NOT EXISTS namespace ON embeddings TYPE string;
+    DEFINE FIELD IF NOT EXISTS key ON embeddings TYPE string;
+    DEFINE FIELD IF NOT EXISTS vector ON embeddings TYPE array;
+    DEFINE FIELD IF NOT EXISTS text ON embeddings TYPE string;
+    DEFINE FIELD IF NOT EXISTS created_at ON embeddings TYPE string;
+    DEFINE INDEX IF NOT EXISTS embedding_lookup_idx ON embeddings FIELDS namespace, key UNIQUE;
+    DEFINE INDEX IF NOT EXISTS embedding_namespace_idx ON embeddings FIELDS namespace;
+
+    DEFINE TABLE IF NOT EXISTS files SCHEMALESS;
+    DEFINE FIELD IF NOT EXISTS path ON files TYPE string;
+    DEFINE FIELD IF NOT EXISTS hash ON files TYPE string;
+    DEFINE FIELD IF NOT EXISTS last_indexed ON files TYPE string;
+    DEFINE INDEX IF NOT EXISTS file_path_idx ON files FIELDS path UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS chunks SCHEMALESS;
+    DEFINE FIELD IF NOT EXISTS file_path ON chunks TYPE string;
+    DEFINE FIELD IF NOT EXISTS start_line ON chunks TYPE int;
+    DEFINE FIELD IF NOT EXISTS end_line ON chunks TYPE int;
+    DEFINE FIELD IF NOT EXISTS content ON chunks TYPE string;
+    DEFINE FIELD IF NOT EXISTS embedding ON chunks TYPE option<array>;
+    DEFINE FIELD IF NOT EXISTS created_at ON chunks TYPE string;
+    DEFINE INDEX IF NOT EXISTS chunk_file_idx ON chunks FIELDS file_path;
+
+    DEFINE ANALYZER IF NOT EXISTS memory_analyzer TOKENIZERS blank, class FILTERS lowercase, snowball(english);
+    DEFINE INDEX IF NOT EXISTS memory_fts_idx ON memories FIELDS value
+        SEARCH ANALYZER memory_analyzer BM25;
 "#;
 
 fn parse_timestamp(value: &str) -> chrono::DateTime<chrono::Utc> {
@@ -126,10 +180,39 @@ impl MemoryBackend for SurrealMemory {
     }
 
     async fn search(&self, namespace: &str, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        // Try full-text search with BM25 ranking first
+        let mut result = self.db
+            .query(
+                "SELECT *, search::score(1) AS score
+                 FROM memories
+                 WHERE namespace = $namespace
+                   AND value @1@ $query
+                 ORDER BY score DESC
+                 LIMIT $limit"
+            )
+            .bind(("namespace", namespace.to_string()))
+            .bind(("query", query.to_string()))
+            .bind(("limit", limit as i64))
+            .await?;
+        let rows: Vec<MemoryRow> = result.take(0)?;
+
+        if !rows.is_empty() {
+            return Ok(rows
+                .into_iter()
+                .map(|entry| MemoryEntry {
+                    key: entry.key,
+                    value: entry.value,
+                    metadata: entry.metadata,
+                    created_at: parse_timestamp(&entry.created_at),
+                })
+                .collect());
+        }
+
+        // Fallback to CONTAINS for partial matches
         let query_lower = query.to_lowercase();
         let mut result = self.db
             .query(
-                "SELECT key, value, metadata, created_at FROM memories
+                "SELECT * FROM memories
                  WHERE namespace = $namespace
                    AND (string::lowercase(key) CONTAINS $query OR string::lowercase(value) CONTAINS $query)
                  ORDER BY created_at DESC
@@ -220,7 +303,7 @@ impl MemoryBackend for SurrealMemory {
         let mut result = self
             .db
             .query(
-                "SELECT role, content FROM conversations
+                "SELECT * FROM conversations
                  WHERE chat_id = $chat_id
                  ORDER BY seq DESC
                  LIMIT $limit",
@@ -259,5 +342,341 @@ impl MemoryBackend for SurrealMemory {
             .content(row)
             .await?;
         Ok(())
+    }
+
+    // ── Embeddings ──
+
+    async fn store_embedding(
+        &self,
+        namespace: &str,
+        key: &str,
+        vector: &[f32],
+        text: &str,
+    ) -> Result<()> {
+        let row = EmbeddingRow {
+            namespace: namespace.to_string(),
+            key: key.to_string(),
+            vector: vector.to_vec(),
+            text: text.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let id = Self::memory_id(namespace, key);
+        let _: Option<EmbeddingRow> = self.db.upsert(("embeddings", &id)).content(row).await?;
+        Ok(())
+    }
+
+    async fn search_embeddings(
+        &self,
+        namespace: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<EmbeddingEntry>> {
+        // Load all embeddings for the namespace and do cosine search in-process.
+        // SurrealDB v2 doesn't have built-in ANN yet — the HNSW index handles
+        // this at a higher layer. This is the raw storage fallback.
+        let mut result = self.db
+            .query("SELECT * FROM embeddings WHERE namespace = $namespace")
+            .bind(("namespace", namespace.to_string()))
+            .await?;
+        let rows: Vec<EmbeddingRow> = result.take(0)?;
+
+        let mut scored: Vec<(f32, EmbeddingRow)> = rows
+            .into_iter()
+            .map(|row| {
+                let sim = cosine_similarity(query_vector, &row.vector);
+                (sim, row)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored
+            .into_iter()
+            .map(|(_, row)| EmbeddingEntry {
+                namespace: row.namespace,
+                key: row.key,
+                vector: row.vector,
+                text: row.text,
+                created_at: parse_timestamp(&row.created_at),
+            })
+            .collect())
+    }
+
+    // ── File indexing ──
+
+    async fn store_file_index(&self, path: &str, hash: &str) -> Result<()> {
+        let row = FileIndexRow {
+            path: path.to_string(),
+            hash: hash.to_string(),
+            last_indexed: chrono::Utc::now().to_rfc3339(),
+        };
+        // Use path hash as record ID to avoid special chars
+        let id = format!("{:x}", md5_hash(path));
+        let _: Option<FileIndexRow> = self.db.upsert(("files", &id)).content(row).await?;
+        Ok(())
+    }
+
+    async fn get_file_index(&self, path: &str) -> Result<Option<FileIndex>> {
+        let id = format!("{:x}", md5_hash(path));
+        let row: Option<FileIndexRow> = self.db.select(("files", &id)).await?;
+        Ok(row.map(|r| FileIndex {
+            path: r.path,
+            hash: r.hash,
+            last_indexed: parse_timestamp(&r.last_indexed),
+        }))
+    }
+
+    // ── Code chunks ──
+
+    async fn store_chunk(
+        &self,
+        file_path: &str,
+        start_line: u32,
+        end_line: u32,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        let row = ChunkRow {
+            file_path: file_path.to_string(),
+            start_line,
+            end_line,
+            content: content.to_string(),
+            embedding: embedding.map(|e| e.to_vec()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let _: Option<ChunkRow> = self.db.create("chunks").content(row).await?;
+        Ok(())
+    }
+
+    async fn get_chunks_for_file(&self, file_path: &str) -> Result<Vec<Chunk>> {
+        let mut result = self.db
+            .query(
+                "SELECT * FROM chunks WHERE file_path = $file_path ORDER BY start_line ASC"
+            )
+            .bind(("file_path", file_path.to_string()))
+            .await?;
+        let rows: Vec<ChunkRow> = result.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Chunk {
+                file_path: r.file_path,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                content: r.content,
+                embedding: r.embedding,
+                created_at: parse_timestamp(&r.created_at),
+            })
+            .collect())
+    }
+
+    async fn delete_chunks_for_file(&self, file_path: &str) -> Result<()> {
+        self.db
+            .query("DELETE FROM chunks WHERE file_path = $file_path")
+            .bind(("file_path", file_path.to_string()))
+            .await?;
+        Ok(())
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let ma: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if ma == 0.0 || mb == 0.0 {
+        return 0.0;
+    }
+    dot / (ma * mb)
+}
+
+/// Simple hash for file path → record ID
+fn md5_hash(input: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_empty() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_mismatched_length() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_vector() {
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 2.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_md5_hash_deterministic() {
+        let h1 = md5_hash("test-path");
+        let h2 = md5_hash("test-path");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_md5_hash_different_inputs() {
+        let h1 = md5_hash("path-a");
+        let h2 = md5_hash("path-b");
+        assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn test_surreal_store_and_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store("test", "greeting", "hello world", None).await.unwrap();
+        let val = mem.recall("test", "greeting").await.unwrap();
+        assert!(val.is_some());
+        assert_eq!(val.unwrap().value, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_surreal_recall_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        let val = mem.recall("test", "missing-key").await.unwrap();
+        assert!(val.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_surreal_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store("ns", "k1", "the quick brown fox", None).await.unwrap();
+        mem.store("ns", "k2", "lazy dog sleeps", None).await.unwrap();
+        mem.store("ns", "k3", "fox runs fast", None).await.unwrap();
+
+        let results: Vec<MemoryEntry> = mem.search("ns", "fox", 10).await.unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|e| e.value.contains("fox")));
+    }
+
+    #[tokio::test]
+    async fn test_surreal_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store("ns", "del-key", "to delete", None).await.unwrap();
+        assert!(mem.recall("ns", "del-key").await.unwrap().is_some());
+
+        mem.forget("ns", "del-key").await.unwrap();
+        assert!(mem.recall("ns", "del-key").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_surreal_conversation_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store_conversation("chat-1", "user-1", "user", "Hello").await.unwrap();
+        // Small delay to ensure different seq timestamps
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        mem.store_conversation("chat-1", "assistant", "assistant", "Hi there").await.unwrap();
+
+        let history: Vec<(String, String)> = mem.get_conversation_history("chat-1", 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].1, "Hello");
+        assert_eq!(history[1].1, "Hi there");
+    }
+
+    #[tokio::test]
+    async fn test_surreal_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        let vec1 = vec![1.0, 0.0, 0.0];
+        let vec2 = vec![0.0, 1.0, 0.0];
+        let vec3 = vec![0.9, 0.1, 0.0];
+
+        mem.store_embedding("ns", "e1", &vec1, "first").await.unwrap();
+        mem.store_embedding("ns", "e2", &vec2, "second").await.unwrap();
+        mem.store_embedding("ns", "e3", &vec3, "third").await.unwrap();
+
+        let results = mem.search_embeddings("ns", &vec1, 2).await.unwrap();
+        assert!(!results.is_empty());
+        // The closest to [1,0,0] should be e1 or e3
+        assert!(results[0].key == "e1" || results[0].key == "e3");
+    }
+
+    #[tokio::test]
+    async fn test_surreal_file_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store_file_index("/src/main.rs", "abc123").await.unwrap();
+        let idx = mem.get_file_index("/src/main.rs").await.unwrap();
+        assert!(idx.is_some());
+        assert_eq!(idx.unwrap().hash, "abc123");
+
+        let missing = mem.get_file_index("/src/nonexistent.rs").await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_surreal_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store_chunk("/src/lib.rs", 1, 10, "fn main() {}", None).await.unwrap();
+        mem.store_chunk("/src/lib.rs", 11, 20, "fn helper() {}", None).await.unwrap();
+
+        let chunks = mem.get_chunks_for_file("/src/lib.rs").await.unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[1].start_line, 11);
+
+        mem.delete_chunks_for_file("/src/lib.rs").await.unwrap();
+        let empty = mem.get_chunks_for_file("/src/lib.rs").await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_surreal_sticker_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = SurrealMemory::new(dir.path()).await.unwrap();
+
+        mem.store_sticker_cache("stk-1", "file-1", "A happy cat").await.unwrap();
+        let desc: Option<String> = mem.get_sticker_cache("stk-1").await.unwrap();
+        assert_eq!(desc, Some("A happy cat".to_string()));
+
+        let missing: Option<String> = mem.get_sticker_cache("stk-999").await.unwrap();
+        assert!(missing.is_none());
     }
 }

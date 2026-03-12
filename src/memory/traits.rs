@@ -12,6 +12,35 @@ pub struct MemoryEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Embedding entry (vector + source text)
+#[derive(Debug, Clone)]
+pub struct EmbeddingEntry {
+    pub namespace: String,
+    pub key: String,
+    pub vector: Vec<f32>,
+    pub text: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Indexed file record
+#[derive(Debug, Clone)]
+pub struct FileIndex {
+    pub path: String,
+    pub hash: String,
+    pub last_indexed: chrono::DateTime<chrono::Utc>,
+}
+
+/// Code chunk with optional embedding
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub content: String,
+    pub embedding: Option<Vec<f32>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// The core MemoryBackend trait.
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
@@ -79,4 +108,70 @@ pub trait MemoryBackend: Send + Sync {
         file_id: &str,
         description: &str,
     ) -> anyhow::Result<()>;
+
+    // ── Embeddings ──
+
+    /// Store a vector embedding for a memory key
+    async fn store_embedding(
+        &self,
+        namespace: &str,
+        key: &str,
+        vector: &[f32],
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (namespace, key, vector, text);
+        Ok(())
+    }
+
+    /// Search embeddings by cosine similarity (returns nearest matches)
+    async fn search_embeddings(
+        &self,
+        namespace: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<EmbeddingEntry>> {
+        let _ = (namespace, query_vector, limit);
+        Ok(Vec::new())
+    }
+
+    // ── File indexing ──
+
+    /// Record that a file has been indexed
+    async fn store_file_index(&self, path: &str, hash: &str) -> anyhow::Result<()> {
+        let _ = (path, hash);
+        Ok(())
+    }
+
+    /// Get file index entry (to check if re-indexing is needed)
+    async fn get_file_index(&self, path: &str) -> anyhow::Result<Option<FileIndex>> {
+        let _ = path;
+        Ok(None)
+    }
+
+    // ── Code chunks ──
+
+    /// Store a code chunk with optional embedding
+    async fn store_chunk(
+        &self,
+        file_path: &str,
+        start_line: u32,
+        end_line: u32,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> anyhow::Result<()> {
+        let _ = (file_path, start_line, end_line, content, embedding);
+        Ok(())
+    }
+
+    /// Search chunks by file path
+    async fn get_chunks_for_file(&self, file_path: &str) -> anyhow::Result<Vec<Chunk>> {
+        let _ = file_path;
+        Ok(Vec::new())
+    }
+
+    /// Delete all chunks for a file (before re-indexing)
+    async fn delete_chunks_for_file(&self, file_path: &str) -> anyhow::Result<()> {
+        let _ = file_path;
+        Ok(())
+    }
 }

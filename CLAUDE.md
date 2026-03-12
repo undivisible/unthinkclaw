@@ -1,1 +1,179 @@
-AGENTS.md
+# AGENTS.md — unthinkclaw Engineering Protocol
+
+Scope: entire repository.
+
+## 1) Project Snapshot
+
+unthinkclaw is a lean, fast Rust AI agent runtime — Telegram-first, trait-driven, SQLite-backed.
+
+Goals:
+- Small binary (<10MB), fast startup (<10ms), low RAM (<10MB)
+- Async-first (tokio), no blocking on the runtime thread
+- Swappable providers, channels, tools via traits
+- Persistent memory with FTS5 + vector hybrid search
+- Agent swarm support (parallel sub-agents)
+
+Key extension points:
+- `src/providers/traits.rs` — AI model providers
+- `src/channels/traits.rs` — messaging channels
+- `src/tools/traits.rs` — tool execution
+- `src/memory/` — SQLite memory backend
+
+## 2) Architecture
+
+```
+src/
+  main.rs              — CLI entrypoint
+  lib.rs               — module exports
+  config/              — config schema + loading
+  agent/               — orchestration loop (loop_runner.rs)
+  channels/            — Telegram, Discord, Slack, CLI, etc.
+  providers/           — Anthropic, OpenAI-compat, Ollama, Copilot
+  tools/               — shell, file_ops, web_search, web_fetch, edit, vibemania
+  memory/              — SQLite (FTS5, vector, sticker cache, conversation history)
+  swarm.rs             — parallel sub-agent spawning
+  cron_scheduler.rs    — scheduled tasks
+  heartbeat.rs         — periodic background checks
+  plugin.rs            — plugin system
+  skills.rs            — skill loading from TOML manifests
+  cost.rs              — token cost tracking
+  embeddings.rs        — embedding provider trait
+  gateway/             — webhook server
+  runtime/             — native runtime adapter
+```
+
+## 3) Engineering Principles
+
+### 3.1 Async-First
+- All I/O must use `tokio` async primitives
+- SQLite calls go through `spawn_blocking` — never block the tokio thread pool
+- Voice/audio transcription uses `tokio::process::Command`, not `std::process::Command`
+
+### 3.2 KISS
+- Prefer explicit match branches over dynamic dispatch where possible
+- Keep error paths obvious — use `?` and `bail!`
+- No clever meta-programming in security-sensitive paths
+
+### 3.3 YAGNI
+- Don't add config keys or feature flags without a concrete use case
+- Don't add speculative abstractions
+
+### 3.4 Secure by Default
+- Deny-by-default for channel allowlists
+- Never log tokens, API keys, or message content
+- Filesystem access scoped to workspace
+
+### 3.5 Fail Fast
+- Unsupported states should error explicitly, not silently fall back
+- Validate inputs at tool boundaries
+
+## 4) Key Implementation Notes
+
+### Memory (sqlite.rs)
+- Uses WAL mode + NORMAL sync for performance
+- FTS5 virtual table for full-text search
+- `spawn_blocking` for all DB ops
+- Sticker cache: `sticker_id → description` (avoids re-analysis)
+- Conversation history: last 20 messages per chat_id, loaded on each request
+
+### Telegram (telegram.rs)
+- Markdown sanitizer: single-pass state machine (not asterisk counting)
+- Message chunking: paragraph-aware, 4096-char Telegram limit
+- Markdown fallback: try with parse_mode, retry without on error
+- Voice: `tokio::process::Command` for faster-whisper transcription
+
+### Loop Runner (loop_runner.rs)
+- Circuit breaker: 50 rounds max
+- Loop detection: hashes identical tool calls
+- Progress channel: receiver is kept alive (not dropped)
+- History: last 20 messages loaded from SQLite, ordered ASC
+
+### Swarm (swarm.rs)
+- Spawns parallel Codex sub-agents via API
+- Each agent gets isolated context
+- Results merged back to caller
+- Used for: security audits, code review, parallel research
+
+## 5) Channels
+
+| Channel | Status | Notes |
+|---------|--------|-------|
+| Telegram | ✅ Primary | Full support |
+| Discord | ✅ | Native markdown |
+| Slack | ✅ | |
+| CLI | ✅ | Dev/testing |
+| WhatsApp | ✅ | |
+| Matrix | ✅ | |
+| Signal | ✅ | |
+| IRC | ✅ | |
+| Google Chat | ✅ | |
+| MS Teams | ✅ | |
+
+## 6) Providers
+
+| Provider | Notes |
+|----------|-------|
+| Anthropic | Primary (Codex-sonnet-4-5 default) |
+| OpenAI-compat | Any OpenAI-compatible endpoint |
+| Ollama | Local + remote |
+| GitHub Copilot | OAuth flow |
+
+## 7) Tools
+
+| Tool | Description |
+|------|-------------|
+| shell | Execute shell commands |
+| file_ops | Read/write/list files |
+| web_search | Perplexity/Brave search |
+| web_fetch | Fetch URL content |
+| edit | Surgical file edits |
+| message | Send Telegram/Discord messages |
+| vibemania | Subspace coding agent |
+| dynamic | Dynamically loaded tools |
+| session | Session management |
+
+## 8) Validation
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo test
+```
+
+## 9) Workflow
+
+- Work on feature branches, not main
+- Small focused commits
+- `cargo build --release` before pushing — verify binary size stays <10MB
+- No blocking calls on async runtime
+- No secrets in commits
+
+## 10) Anti-Patterns (Do Not)
+
+- Do not call `std::process::Command` in async context — use `tokio::process::Command`
+- Do not call SQLite directly from async — use `spawn_blocking`
+- Do not drop progress channel receivers
+- Do not use global asterisk counting for markdown — use state machine
+- Do not add heavy dependencies for minor convenience
+- Do not silently weaken security/allowlist defaults
+- Do not mix unrelated changes in one commit
+
+## 11) Adding Things
+
+### New Provider
+- Implement `Provider` trait in `src/providers/`
+- Register in `src/providers/mod.rs`
+
+### New Channel
+- Implement `Channel` trait in `src/channels/`
+- Handle allowlist, typing indicators, message chunking
+
+### New Tool
+- Implement `Tool` trait in `src/tools/`
+- Validate all inputs, return structured `ToolResult`
+- Never panic in tool execution path
+
+### New Memory Backend
+- Implement `Memory` trait in `src/memory/`
+- All DB ops via `spawn_blocking`

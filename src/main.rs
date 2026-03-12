@@ -1399,30 +1399,18 @@ async fn build_memory_backend(
             &storage_root.join("memory.db").to_string_lossy(),
         )?)),
         "surreal" => {
-            #[cfg(feature = "swarm")]
-            {
-                let surreal_path = storage_root.join("memory.surreal");
-                let memory =
-                    unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path())
-                        .await?;
-                Ok(Arc::new(memory))
-            }
-            #[cfg(not(feature = "swarm"))]
-            {
-                anyhow::bail!(
-                    "storage.backend=surreal requires the 'swarm' feature (SurrealDB + RocksDB)"
-                );
-            }
+            let surreal_path = storage_root.join("memory.surreal");
+            let memory =
+                unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path()).await?;
+            Ok(Arc::new(memory))
         }
         _ => {
-            #[cfg(feature = "swarm")]
+            // Default: try SurrealDB first, fall back to SQLite
+            let surreal_path = storage_root.join("memory.surreal");
+            if let Ok(memory) =
+                unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path()).await
             {
-                let surreal_path = storage_root.join("memory.surreal");
-                if let Ok(memory) =
-                    unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path()).await
-                {
-                    return Ok(Arc::new(memory));
-                }
+                return Ok(Arc::new(memory));
             }
 
             Ok(Arc::new(SqliteMemory::new(
