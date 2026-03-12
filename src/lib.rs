@@ -25,6 +25,7 @@ pub mod diagnostics;
 pub mod embeddings;
 pub mod gateway;
 pub mod heartbeat;
+pub mod hosted;
 pub mod mcp;
 pub mod memory;
 pub mod plugin;

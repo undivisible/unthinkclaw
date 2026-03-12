@@ -130,7 +130,12 @@ impl AgentRunner {
 
     /// List available tools
     pub async fn list_tools(&self) -> Vec<String> {
-        self.tools.read().await.iter().map(|t| t.name().to_string()).collect()
+        self.tools
+            .read()
+            .await
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
     }
 
     /// Add a tool at runtime (for late-binding tools like session_status)
@@ -150,21 +155,30 @@ impl AgentRunner {
             match self.handle_message(&msg, Some(&progress_tx)).await {
                 Ok(response) => {
                     // Signal done to progress tracker
-                    let _ = progress_tx.send(ProgressUpdate::Processing { round: 0, tool_count: 0 }).await;
+                    let _ = progress_tx
+                        .send(ProgressUpdate::Processing {
+                            round: 0,
+                            tool_count: 0,
+                        })
+                        .await;
 
-                    channel.send(OutgoingMessage {
-                        chat_id: msg.chat_id.clone(),
-                        text: response,
-                        reply_to: Some(msg.id.clone()),
-                    }).await?;
+                    channel
+                        .send(OutgoingMessage {
+                            chat_id: msg.chat_id.clone(),
+                            text: response,
+                            reply_to: Some(msg.id.clone()),
+                        })
+                        .await?;
                 }
                 Err(e) => {
                     tracing::error!("Error handling message: {}", e);
-                    channel.send(OutgoingMessage {
-                        chat_id: msg.chat_id,
-                        text: format!("Error: {}", e),
-                        reply_to: Some(msg.id),
-                    }).await?;
+                    channel
+                        .send(OutgoingMessage {
+                            chat_id: msg.chat_id,
+                            text: format!("Error: {}", e),
+                            reply_to: Some(msg.id),
+                        })
+                        .await?;
                 }
             }
         }
@@ -180,7 +194,10 @@ impl AgentRunner {
         mut extra_rx: mpsc::Receiver<IncomingMessage>,
     ) -> anyhow::Result<()> {
         let mut rx = channel.start().await?;
-        tracing::info!("Agent started on channel: {} (with heartbeat)", channel.name());
+        tracing::info!(
+            "Agent started on channel: {} (with heartbeat)",
+            channel.name()
+        );
 
         loop {
             let msg = tokio::select! {
@@ -197,20 +214,24 @@ impl AgentRunner {
                         tracing::debug!("Heartbeat: agent responded OK, skipping output");
                         continue;
                     }
-                    channel.send(OutgoingMessage {
-                        chat_id: msg.chat_id.clone(),
-                        text: response,
-                        reply_to: Some(msg.id.clone()),
-                    }).await?;
+                    channel
+                        .send(OutgoingMessage {
+                            chat_id: msg.chat_id.clone(),
+                            text: response,
+                            reply_to: Some(msg.id.clone()),
+                        })
+                        .await?;
                 }
                 Err(e) => {
                     tracing::error!("Error handling message: {}", e);
                     if msg.sender_id != "system" {
-                        channel.send(OutgoingMessage {
-                            chat_id: msg.chat_id,
-                            text: format!("Error: {}", e),
-                            reply_to: Some(msg.id),
-                        }).await?;
+                        channel
+                            .send(OutgoingMessage {
+                                chat_id: msg.chat_id,
+                                text: format!("Error: {}", e),
+                                reply_to: Some(msg.id),
+                            })
+                            .await?;
                     }
                 }
             }
@@ -222,7 +243,7 @@ impl AgentRunner {
 
     async fn setup_progress(&self, _channel: &dyn Channel) -> mpsc::Sender<ProgressUpdate> {
         let (tx, mut rx) = mpsc::channel(32);
-        
+
         // Clone channel for the progress task
         // Note: This requires Channel to be Clone or use Arc
         // For now, we'll skip the actual typing indicator until Channel is made Clone-safe
@@ -232,7 +253,7 @@ impl AgentRunner {
                 // For now, just drain the channel
             }
         });
-        
+
         tx
     }
 
@@ -275,7 +296,10 @@ impl AgentRunner {
         }
 
         // Load conversation history from SQLite (LIMITED to 8 to save tokens)
-        let history = self.memory.get_conversation_history(&msg.chat_id, MAX_HISTORY_MESSAGES).await?;
+        let history = self
+            .memory
+            .get_conversation_history(&msg.chat_id, MAX_HISTORY_MESSAGES)
+            .await?;
         for (role, content) in history {
             match role.as_str() {
                 "user" => messages.push(ChatMessage::user(&content)),
@@ -288,9 +312,8 @@ impl AgentRunner {
         messages.push(ChatMessage::user(&msg.text));
 
         // Tool specs — snapshot at message start
-        let tool_specs: Vec<crate::tools::ToolSpec> = self.tools.read().await.iter()
-            .map(|t| t.spec())
-            .collect();
+        let tool_specs: Vec<crate::tools::ToolSpec> =
+            self.tools.read().await.iter().map(|t| t.spec()).collect();
         let tools_snapshot: Vec<Arc<dyn Tool>> = self.tools.read().await.iter().cloned().collect();
         let main_model = self.model.read().unwrap().clone();
 
@@ -300,7 +323,11 @@ impl AgentRunner {
 
         // Step 1: Decide if this needs planning or is a direct response
         let needs_tools = self.classify_request(&msg.text, &main_model).await;
-        let mut state = if needs_tools { AgentState::Planning } else { AgentState::Direct };
+        let mut state = if needs_tools {
+            AgentState::Planning
+        } else {
+            AgentState::Direct
+        };
         tracing::info!("Initial state: {:?}", state);
 
         // Step 2: If planning, ask Haiku to make a plan + choose execution model
@@ -344,19 +371,30 @@ impl AgentRunner {
 
                     // Track cost
                     if let Some(usage) = &resp.usage {
-                        let _ = self.cost_tracker.record(FAST_MODEL, TokenUsage {
-                            input_tokens: usage.input_tokens as usize,
-                            output_tokens: usage.output_tokens as usize,
-                            total_tokens: (usage.input_tokens + usage.output_tokens) as usize,
-                        }).await;
+                        let _ = self
+                            .cost_tracker
+                            .record(
+                                FAST_MODEL,
+                                TokenUsage {
+                                    input_tokens: usage.input_tokens as usize,
+                                    output_tokens: usage.output_tokens as usize,
+                                    total_tokens: (usage.input_tokens + usage.output_tokens)
+                                        as usize,
+                                },
+                            )
+                            .await;
                     }
 
                     // Parse model choice from plan
                     let p_upper = p.to_uppercase();
-                    if p_upper.contains("MODEL_CHOICE: OPUS") || p_upper.contains("MODEL_CHOICE:OPUS") {
+                    if p_upper.contains("MODEL_CHOICE: OPUS")
+                        || p_upper.contains("MODEL_CHOICE:OPUS")
+                    {
                         execution_model = HEAVY_MODEL.to_string();
                         tracing::info!("Planner chose OPUS for execution");
-                    } else if p_upper.contains("MODEL_CHOICE: VIBEMANIA") || p_upper.contains("MODEL_CHOICE:VIBEMANIA") {
+                    } else if p_upper.contains("MODEL_CHOICE: VIBEMANIA")
+                        || p_upper.contains("MODEL_CHOICE:VIBEMANIA")
+                    {
                         // Route to vibemania — inject directive
                         tracing::info!("Planner chose VIBEMANIA — routing to subspace");
                         messages.push(ChatMessage::system(
@@ -370,7 +408,8 @@ impl AgentRunner {
 
                     // Inject plan
                     messages.push(ChatMessage::system(format!(
-                        "EXECUTION PLAN (follow these steps):\n{}", p
+                        "EXECUTION PLAN (follow these steps):\n{}",
+                        p
                     )));
                     plan = Some(p);
                     state = AgentState::Executing;
@@ -394,7 +433,8 @@ impl AgentRunner {
                     for steer_msg in queue.drain(..) {
                         tracing::info!("Steering: {}", &steer_msg[..steer_msg.len().min(80)]);
                         messages.push(ChatMessage::user(format!(
-                            "⚡ STEERING — new instruction from user (prioritize this): {}", steer_msg
+                            "⚡ STEERING — new instruction from user (prioritize this): {}",
+                            steer_msg
                         )));
                     }
                 }
@@ -403,7 +443,11 @@ impl AgentRunner {
             // Context budget check — compact if too large
             let context_chars: usize = messages.iter().map(|m| m.content.len()).sum();
             if context_chars > MAX_CONTEXT_CHARS {
-                tracing::info!("Compacting at round {} ({} chars)", round + 1, context_chars);
+                tracing::info!(
+                    "Compacting at round {} ({} chars)",
+                    round + 1,
+                    context_chars
+                );
                 messages = self.compact_messages(messages, &msg.text).await?;
                 compactions_done += 1;
             }
@@ -416,9 +460,14 @@ impl AgentRunner {
                 AgentState::Direct => (main_model.clone(), 0.7),
             };
 
-            tracing::info!("[{:?}] round {} — {} msgs, ~{} chars, model={}", 
-                state, round + 1, messages.len(),
-                messages.iter().map(|m| m.content.len()).sum::<usize>(), model);
+            tracing::info!(
+                "[{:?}] round {} — {} msgs, ~{} chars, model={}",
+                state,
+                round + 1,
+                messages.len(),
+                messages.iter().map(|m| m.content.len()).sum::<usize>(),
+                model
+            );
 
             let request = ChatRequest {
                 messages: &messages,
@@ -436,11 +485,17 @@ impl AgentRunner {
 
             // Track cost
             if let Some(usage) = &response.usage {
-                let _ = self.cost_tracker.record(&model, TokenUsage {
-                    input_tokens: usage.input_tokens as usize,
-                    output_tokens: usage.output_tokens as usize,
-                    total_tokens: (usage.input_tokens + usage.output_tokens) as usize,
-                }).await;
+                let _ = self
+                    .cost_tracker
+                    .record(
+                        &model,
+                        TokenUsage {
+                            input_tokens: usage.input_tokens as usize,
+                            output_tokens: usage.output_tokens as usize,
+                            total_tokens: (usage.input_tokens + usage.output_tokens) as usize,
+                        },
+                    )
+                    .await;
             }
 
             if !response.has_tool_calls() {
@@ -451,12 +506,16 @@ impl AgentRunner {
                     AgentState::Executing => {
                         // Execution done — summarize with Haiku if we did significant work
                         if round >= 3 {
-                            tracing::info!("Execution done after {} rounds, summarizing", round + 1);
+                            tracing::info!(
+                                "Execution done after {} rounds, summarizing",
+                                round + 1
+                            );
                             state = AgentState::Summarizing;
                             messages.push(ChatMessage::assistant(text));
                             messages.push(ChatMessage::user(
                                 "Now provide a clean, concise final response to the user. \
-                                Summarize what you did and the results. Be brief and direct.".to_string()
+                                Summarize what you did and the results. Be brief and direct."
+                                    .to_string(),
                             ));
                             continue; // One more round with Haiku for summary
                         }
@@ -477,20 +536,31 @@ impl AgentRunner {
 
             // Loop detection
             for tc in &response.tool_calls {
-                let hash = format!("{}:{}", tc.name, &tc.arguments[..tc.arguments.len().min(200)]);
+                let hash = format!(
+                    "{}:{}",
+                    tc.name,
+                    &tc.arguments[..tc.arguments.len().min(200)]
+                );
                 tool_call_history.push(hash);
             }
             if tool_call_history.len() >= LOOP_BREAK_THRESHOLD {
                 let last = &tool_call_history[tool_call_history.len() - 1];
-                let consecutive = tool_call_history.iter().rev().take_while(|h| *h == last).count();
+                let consecutive = tool_call_history
+                    .iter()
+                    .rev()
+                    .take_while(|h| *h == last)
+                    .count();
                 if consecutive >= LOOP_BREAK_THRESHOLD {
                     tracing::warn!("Loop: {} identical calls, breaking", consecutive);
-                    return Ok(format!("Loop detected ({} identical {} calls). Stopping.",
-                        consecutive, response.tool_calls[0].name));
+                    return Ok(format!(
+                        "Loop detected ({} identical {} calls). Stopping.",
+                        consecutive, response.tool_calls[0].name
+                    ));
                 }
                 if consecutive >= LOOP_WARN_THRESHOLD {
                     messages.push(ChatMessage::user(
-                        "WARNING: You're repeating tool calls. Stop and answer with what you have.".to_string()
+                        "WARNING: You're repeating tool calls. Stop and answer with what you have."
+                            .to_string(),
                     ));
                 }
             }
@@ -498,10 +568,12 @@ impl AgentRunner {
             // Progress callback
             if let Some(tx) = progress {
                 for tc in &response.tool_calls {
-                    let _ = tx.send(ProgressUpdate::ToolCall {
-                        name: tc.name.clone(),
-                        round: round + 1,
-                    }).await;
+                    let _ = tx
+                        .send(ProgressUpdate::ToolCall {
+                            name: tc.name.clone(),
+                            round: round + 1,
+                        })
+                        .await;
                 }
             }
 
@@ -531,11 +603,19 @@ impl AgentRunner {
             }
 
             // Execute tools
-            tracing::info!("Tools: {}",
-                response.tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>().join(", "));
+            tracing::info!(
+                "Tools: {}",
+                response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
 
             for tc in &response.tool_calls {
-                let result = if let Some(tool) = tools_snapshot.iter().find(|t| t.name() == tc.name) {
+                let result = if let Some(tool) = tools_snapshot.iter().find(|t| t.name() == tc.name)
+                {
                     match tool.execute(&tc.arguments).await {
                         Ok(r) => r,
                         Err(e) => crate::tools::ToolResult::error(format!("Tool error: {}", e)),
@@ -545,8 +625,12 @@ impl AgentRunner {
                 };
 
                 let truncated_output = if result.output.len() > MAX_TOOL_RESULT_CHARS {
-                    format!("{}...\n⚠️ [Truncated {} → {} chars]",
-                        &result.output[..MAX_TOOL_RESULT_CHARS], result.output.len(), MAX_TOOL_RESULT_CHARS)
+                    format!(
+                        "{}...\n⚠️ [Truncated {} → {} chars]",
+                        &result.output[..MAX_TOOL_RESULT_CHARS],
+                        result.output.len(),
+                        MAX_TOOL_RESULT_CHARS
+                    )
                 } else {
                     result.output.clone()
                 };
@@ -561,9 +645,12 @@ impl AgentRunner {
         }
 
         tracing::warn!("Circuit breaker after {} rounds", CIRCUIT_BREAKER_ROUNDS);
-        self.persist_conversation(&msg, &format!("Hit {} rounds.", CIRCUIT_BREAKER_ROUNDS)).await?;
-        Ok(format!("⚠️ Hit {} rounds ({} compactions). Break into smaller tasks?",
-            CIRCUIT_BREAKER_ROUNDS, compactions_done))
+        self.persist_conversation(&msg, &format!("Hit {} rounds.", CIRCUIT_BREAKER_ROUNDS))
+            .await?;
+        Ok(format!(
+            "⚠️ Hit {} rounds ({} compactions). Break into smaller tasks?",
+            CIRCUIT_BREAKER_ROUNDS, compactions_done
+        ))
     }
 
     /// Classify if a request needs tool calls (and thus planning) or is conversational
@@ -573,21 +660,47 @@ impl AgentRunner {
         let word_count = text.split_whitespace().count();
 
         // Short messages are usually conversational
-        if word_count <= 5 { return false; }
+        if word_count <= 5 {
+            return false;
+        }
 
         // Explicit tool-needing keywords
         let tool_keywords = [
-            "read ", "write ", "edit ", "create ", "build ", "fix ", "search ",
-            "fetch ", "check ", "run ", "execute ", "install ", "deploy ",
-            "find ", "list ", "show me ", "what's in ", "look at ",
-            "file", "code", "commit", "git ", "grep", "curl",
+            "read ",
+            "write ",
+            "edit ",
+            "create ",
+            "build ",
+            "fix ",
+            "search ",
+            "fetch ",
+            "check ",
+            "run ",
+            "execute ",
+            "install ",
+            "deploy ",
+            "find ",
+            "list ",
+            "show me ",
+            "what's in ",
+            "look at ",
+            "file",
+            "code",
+            "commit",
+            "git ",
+            "grep",
+            "curl",
         ];
         for kw in &tool_keywords {
-            if lower.contains(kw) { return true; }
+            if lower.contains(kw) {
+                return true;
+            }
         }
 
         // Longer messages with questions are likely complex tasks
-        if word_count >= 15 && (lower.contains('?') || lower.contains("can you") || lower.contains("please")) {
+        if word_count >= 15
+            && (lower.contains('?') || lower.contains("can you") || lower.contains("please"))
+        {
             return true;
         }
 
@@ -595,7 +708,11 @@ impl AgentRunner {
     }
 
     /// Persist user + assistant messages to conversation history
-    async fn persist_conversation(&self, msg: &IncomingMessage, response: &str) -> anyhow::Result<()> {
+    async fn persist_conversation(
+        &self,
+        msg: &IncomingMessage,
+        response: &str,
+    ) -> anyhow::Result<()> {
         self.memory
             .store_conversation_batch(&[
                 (&msg.chat_id, &msg.sender_id, "user", &msg.text),
@@ -613,25 +730,23 @@ impl AgentRunner {
     ) -> anyhow::Result<Vec<ChatMessage>> {
         // Keep: system prompt + last 6 messages (3 exchanges)
         let keep_recent = 6;
-        
+
         if messages.len() <= keep_recent + 2 {
             return Ok(messages); // Nothing to compact
         }
-        
+
         // Split: system messages + old messages + recent messages
-        let system_msgs: Vec<&ChatMessage> = messages.iter()
-            .filter(|m| m.role == "system")
-            .collect();
-        let non_system: Vec<&ChatMessage> = messages.iter()
-            .filter(|m| m.role != "system")
-            .collect();
-        
+        let system_msgs: Vec<&ChatMessage> =
+            messages.iter().filter(|m| m.role == "system").collect();
+        let non_system: Vec<&ChatMessage> =
+            messages.iter().filter(|m| m.role != "system").collect();
+
         if non_system.len() <= keep_recent {
             return Ok(messages);
         }
-        
+
         let (old_msgs, recent_msgs) = non_system.split_at(non_system.len() - keep_recent);
-        
+
         // Build summary of old messages for Haiku
         let mut summary_input = String::new();
         for m in old_msgs {
@@ -649,7 +764,7 @@ impl AgentRunner {
             };
             summary_input.push_str(&format!("[{}]: {}\n", role_label, content));
         }
-        
+
         // Ask Haiku to summarize
         let compaction_prompt = format!(
             "Summarize this conversation concisely. The original task was: \"{}\"\n\n\
@@ -658,7 +773,7 @@ impl AgentRunner {
             original_task,
             summary_input
         );
-        
+
         let compact_messages = [ChatMessage::user(&compaction_prompt)];
         let compact_request = ChatRequest {
             messages: &compact_messages,
@@ -667,16 +782,21 @@ impl AgentRunner {
             temperature: 0.3,
             max_tokens: Some(1000),
         };
-        
+
         let summary = match self.provider.chat(&compact_request).await {
-            Ok(resp) => resp.text.unwrap_or_else(|| "Failed to summarize.".to_string()),
+            Ok(resp) => resp
+                .text
+                .unwrap_or_else(|| "Failed to summarize.".to_string()),
             Err(e) => {
                 tracing::warn!("Compaction failed: {}, falling back to truncation", e);
                 // Fallback: just truncate old messages
-                format!("[Previous {} messages truncated to save context]", old_msgs.len())
+                format!(
+                    "[Previous {} messages truncated to save context]",
+                    old_msgs.len()
+                )
             }
         };
-        
+
         // Rebuild messages: system + summary + recent
         let mut compacted = Vec::new();
         for sm in &system_msgs {
@@ -684,13 +804,16 @@ impl AgentRunner {
         }
         compacted.push(ChatMessage::user(format!(
             "[Conversation compacted — {} earlier messages summarized]\n\n{}",
-            old_msgs.len(), summary
+            old_msgs.len(),
+            summary
         )));
-        compacted.push(ChatMessage::assistant("Understood, continuing from the summary.".to_string()));
+        compacted.push(ChatMessage::assistant(
+            "Understood, continuing from the summary.".to_string(),
+        ));
         for rm in recent_msgs {
             compacted.push((*rm).clone());
         }
-        
+
         Ok(compacted)
     }
 }

@@ -91,13 +91,12 @@ fn parse_skill_frontmatter(content: &str, path: &Path) -> Option<Skill> {
 /// Find the best matching skill for a user message
 /// Stopwords — common words that should never contribute to skill matching
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
-    "her", "was", "one", "our", "out", "has", "have", "been", "some", "them",
-    "than", "its", "over", "such", "that", "this", "with", "will", "each",
-    "from", "they", "were", "which", "their", "said", "what", "when", "who",
-    "how", "use", "new", "now", "way", "may", "get", "got", "set", "let",
-    "any", "also", "into", "just", "only", "very", "even", "most", "other",
-    "need", "make", "like", "does", "your", "more", "want", "should",
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one",
+    "our", "out", "has", "have", "been", "some", "them", "than", "its", "over", "such", "that",
+    "this", "with", "will", "each", "from", "they", "were", "which", "their", "said", "what",
+    "when", "who", "how", "use", "new", "now", "way", "may", "get", "got", "set", "let", "any",
+    "also", "into", "just", "only", "very", "even", "most", "other", "need", "make", "like",
+    "does", "your", "more", "want", "should",
 ];
 
 fn is_stopword(word: &str) -> bool {
@@ -123,8 +122,12 @@ pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Sk
 
         // Word overlap: message words in description (skip stopwords)
         for word in &msg_words {
-            if word.len() < 4 { continue; }
-            if is_stopword(word) { continue; }
+            if word.len() < 4 {
+                continue;
+            }
+            if is_stopword(word) {
+                continue;
+            }
             if desc_lower.contains(word) {
                 score += 1.0;
             }
@@ -132,8 +135,12 @@ pub fn match_skill<'a>(skills: &'a [Skill], user_message: &str) -> Option<&'a Sk
 
         // Word overlap: description words in message (skip stopwords)
         for word in desc_lower.split(|c: char| !c.is_alphanumeric()) {
-            if word.len() < 4 { continue; }
-            if is_stopword(word) { continue; }
+            if word.len() < 4 {
+                continue;
+            }
+            if is_stopword(word) {
+                continue;
+            }
             if msg_lower.contains(word) {
                 score += 1.0;
             }

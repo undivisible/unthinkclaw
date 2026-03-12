@@ -9,34 +9,39 @@ use clap::{Parser, Subcommand};
 use unthinkclaw::agent::AgentRunner;
 #[cfg(feature = "channel-cli")]
 use unthinkclaw::channels::cli::CliChannel;
+#[cfg(feature = "channel-discord")]
+use unthinkclaw::channels::discord::DiscordChannel;
 #[cfg(feature = "channel-telegram")]
 use unthinkclaw::channels::telegram::TelegramChannel;
 use unthinkclaw::channels::Channel as _;
-#[cfg(feature = "channel-discord")]
-use unthinkclaw::channels::discord::DiscordChannel;
 use unthinkclaw::config::Config;
 use unthinkclaw::cron_scheduler::CronScheduler;
 use unthinkclaw::diagnostics::{collect_doctor_report, render_doctor_report, render_findings};
 use unthinkclaw::gateway;
 use unthinkclaw::heartbeat::{self, HeartbeatConfig};
-use unthinkclaw::memory::search::{MemorySearchTool, MemoryGetTool};
+use unthinkclaw::hosted::{default_state_path, HostedRuntime};
+use unthinkclaw::memory::search::{MemoryGetTool, MemorySearchTool};
 use unthinkclaw::memory::sqlite::SqliteMemory;
 use unthinkclaw::memory::MemoryBackend;
 use unthinkclaw::policy::ExecutionPolicy;
 use unthinkclaw::prompt;
-use unthinkclaw::skills;
 #[cfg(feature = "provider-anthropic")]
 use unthinkclaw::providers::anthropic::AnthropicProvider;
 #[cfg(feature = "provider-ollama")]
 use unthinkclaw::providers::ollama::OllamaProvider;
 use unthinkclaw::providers::openai_compat::OpenAiCompatProvider;
 use unthinkclaw::providers::Provider;
+use unthinkclaw::skills;
 use unthinkclaw::tools::file_ops::{FileReadTool, FileWriteTool};
 use unthinkclaw::tools::shell::ShellTool;
 use unthinkclaw::tools::Tool;
 
 #[derive(Parser)]
-#[command(name = "unthinkclaw", about = "Lightweight agent runtime — unthink everything", version)]
+#[command(
+    name = "unthinkclaw",
+    about = "Lightweight agent runtime — unthink everything",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -217,7 +222,7 @@ enum SwarmAction {
     /// Start swarm coordinator
     Start {
         /// SurrealDB path
-        #[arg(long, default_value = ".unthinkclaw/swarm.db")]
+        #[arg(long, default_value = ".unthinkclaw/state.surreal")]
         surreal_path: String,
 
         /// RocksDB cache path
@@ -355,7 +360,7 @@ async fn main() -> anyhow::Result<()> {
 
             let provider = build_provider(&cfg);
             let policy = Arc::new(ExecutionPolicy::from_config(&cfg.policy));
-            let memory = build_memory_backend(&workspace).await?;
+            let memory = build_memory_backend(&workspace, &cfg).await?;
 
             // Build system prompt from workspace context files
             let system_prompt = prompt::build_system_prompt(&workspace).await;
@@ -367,25 +372,11 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Register tools (including memory search/get)
-            let mut tools: Vec<Arc<dyn Tool>> = vec![
-                Arc::new(ShellTool::new(workspace.clone(), Arc::clone(&policy))),           // exec
-                Arc::new(FileReadTool::new(workspace.clone())),        // Read
-                Arc::new(FileWriteTool::new(workspace.clone())),       // Write
-                Arc::new(unthinkclaw::tools::edit::EditTool::new(workspace.clone())), // Edit
-                Arc::new(MemorySearchTool::new(workspace.clone())),    // memory_search
-                Arc::new(MemoryGetTool::new(workspace.clone())),       // memory_get
-                Arc::new(unthinkclaw::tools::web_search::WebSearchTool::new()),  // web_search
-                Arc::new(unthinkclaw::tools::web_fetch::WebFetchTool::new()),    // web_fetch
-                Arc::new(unthinkclaw::tools::doctor::DoctorTool::new()),         // doctor
-                Arc::new(unthinkclaw::tools::session::ListModelsTool::new()),    // list_models
-                Arc::new(unthinkclaw::tools::dynamic::CreateToolTool::new(Arc::clone(&policy))),    // create_tool
-                Arc::new(unthinkclaw::tools::dynamic::ListCustomToolsTool::new()), // list_custom_tools
-                Arc::new(unthinkclaw::tools::browser::BrowserTool::new()),       // browser (agent-browser)
-                Arc::new(unthinkclaw::tools::mcp::McpTool::new()),               // mcp (Codex MCP client)
-            ];
+            let mut tools = build_base_tools(&workspace, Arc::clone(&policy));
 
             // Load any previously created dynamic tools
-            let dynamic_tools = unthinkclaw::tools::dynamic::DynamicTool::load_all(Arc::clone(&policy));
+            let dynamic_tools =
+                unthinkclaw::tools::dynamic::DynamicTool::load_all(Arc::clone(&policy));
             let dynamic_count = dynamic_tools.len();
             for dt in dynamic_tools {
                 tools.push(Arc::new(dt));
@@ -396,18 +387,22 @@ async fn main() -> anyhow::Result<()> {
 
             let runner = AgentRunner::new(provider, tools, memory.clone(), &system_prompt, model)
                 .with_workspace(workspace.clone())
-                .with_skills(discovered_skills.clone()).await;
-            
+                .with_skills(discovered_skills.clone())
+                .await;
+
             // Add claude_usage tool (needs cost tracker reference)
-            runner.add_tool(Arc::new(unthinkclaw::tools::claude_usage::ClaudeUsageTool::new(
-                runner.cost_tracker()
-            ))).await;
+            runner
+                .add_tool(Arc::new(
+                    unthinkclaw::tools::claude_usage::ClaudeUsageTool::new(runner.cost_tracker()),
+                ))
+                .await;
 
             // Start cron scheduler background task
             let cron_db_path = workspace.join(".unthinkclaw/cron.db");
             if let Ok(cron_sched) = CronScheduler::new(&cron_db_path.to_string_lossy()) {
                 let cron_sched = Arc::new(cron_sched);
-                let (_cron_rx, _cron_shutdown) = unthinkclaw::cron_scheduler::start_cron_ticker(cron_sched);
+                let (_cron_rx, _cron_shutdown) =
+                    unthinkclaw::cron_scheduler::start_cron_ticker(cron_sched);
                 // Due jobs from cron_rx would be handled here in a full implementation
                 // For now, the ticker runs and logs due jobs
             }
@@ -415,7 +410,12 @@ async fn main() -> anyhow::Result<()> {
             match channel.as_str() {
                 #[cfg(feature = "channel-cli")]
                 "cli" => {
-                    println!("unthinkclaw v{} — {} via {}", env!("CARGO_PKG_VERSION"), cfg.model, cfg.provider.name);
+                    println!(
+                        "unthinkclaw v{} — {} via {}",
+                        env!("CARGO_PKG_VERSION"),
+                        cfg.model,
+                        cfg.provider.name
+                    );
                     println!("   Workspace: {}", workspace.display());
                     println!("   Channel: CLI");
                     println!("   Type /quit to exit\n");
@@ -433,14 +433,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(feature = "channel-telegram")]
                 "telegram" => {
-                    let token = telegram_token.ok_or_else(|| anyhow::anyhow!("--telegram-token required"))?;
-                    let chat_id = telegram_chat_id.ok_or_else(|| anyhow::anyhow!("--telegram-chat-id required"))?;
+                    let token = telegram_token
+                        .ok_or_else(|| anyhow::anyhow!("--telegram-token required"))?;
+                    let chat_id = telegram_chat_id
+                        .ok_or_else(|| anyhow::anyhow!("--telegram-chat-id required"))?;
 
                     let tg = TelegramChannel::new(token.clone(), chat_id);
                     let tg_arc = Arc::new(tg.clone());
 
                     // Add late-binding tools that need references
-                    runner.add_tool(Arc::new(unthinkclaw::tools::message::MessageTool::new(tg_arc.clone()))).await;
+                    runner
+                        .add_tool(Arc::new(unthinkclaw::tools::message::MessageTool::new(
+                            tg_arc.clone(),
+                        )))
+                        .await;
 
                     // Wrap runner in Arc for session_status
                     let runner = Arc::new(runner);
@@ -460,7 +466,9 @@ async fn main() -> anyhow::Result<()> {
                         let text = msg.text.trim();
 
                         // If we're processing and this isn't a command, steer
-                        if processing.load(std::sync::atomic::Ordering::SeqCst) && !text.starts_with('/') {
+                        if processing.load(std::sync::atomic::Ordering::SeqCst)
+                            && !text.starts_with('/')
+                        {
                             runner.steer(text.to_string());
                             let _ = tg.send_message("📌 Noted — steering current task.").await;
                             continue;
@@ -478,8 +486,9 @@ async fn main() -> anyhow::Result<()> {
                                     continue;
                                 }
                                 "/help" => {
-                                    let _ = tg.send_message(
-                                        "🐾 *unthinkclaw commands:*\n\n\
+                                    let _ = tg
+                                        .send_message(
+                                            "🐾 *unthinkclaw commands:*\n\n\
                                         /stop — Stop current operation (saves tokens!)\n\
                                         /help — Show this message\n\
                                         /model — Show current model\n\
@@ -489,8 +498,9 @@ async fn main() -> anyhow::Result<()> {
                                         /status — Bot status\n\
                                         /cost — API usage & spending\n\
                                         /reset — Clear conversation history\n\n\
-                                        Everything else is sent to the AI."
-                                    ).await;
+                                        Everything else is sent to the AI.",
+                                        )
+                                        .await;
                                     continue;
                                 }
                                 "/model" | "/model@unthinkclaw_bot" => {
@@ -501,88 +511,111 @@ async fn main() -> anyhow::Result<()> {
                                         )).await;
                                     } else {
                                         runner.set_model(arg);
-                                        let _ = tg.send_message(&format!("✅ Model switched to: `{}`", arg)).await;
+                                        let _ = tg
+                                            .send_message(&format!(
+                                                "✅ Model switched to: `{}`",
+                                                arg
+                                            ))
+                                            .await;
                                         tracing::info!("Model switched to: {}", arg);
                                     }
                                     continue;
                                 }
                                 "/models" => {
-                                    let _ = tg.send_message(
-                                        "📋 *Available models:*\n\n\
+                                    let _ = tg
+                                        .send_message(
+                                            "📋 *Available models:*\n\n\
                                         `claude-sonnet-4-5` — Fast, smart (default)\n\
                                         `claude-opus-4` — Most capable\n\
                                         `claude-haiku-3-5` — Fastest, cheapest\n\n\
-                                        Switch with: `/model claude-opus-4`"
-                                    ).await;
+                                        Switch with: `/model claude-opus-4`",
+                                        )
+                                        .await;
                                     continue;
                                 }
                                 "/tools" => {
                                     let tool_list = runner.list_tools().await;
-                                    let formatted = tool_list.iter()
+                                    let formatted = tool_list
+                                        .iter()
                                         .map(|t| format!("• `{}`", t))
                                         .collect::<Vec<_>>()
                                         .join("\n");
-                                    let _ = tg.send_message(&format!(
-                                        "🔧 *Available tools ({}):\n\n{}*",
-                                        tool_list.len(), formatted
-                                    )).await;
+                                    let _ = tg
+                                        .send_message(&format!(
+                                            "🔧 *Available tools ({}):\n\n{}*",
+                                            tool_list.len(),
+                                            formatted
+                                        ))
+                                        .await;
                                     continue;
                                 }
                                 "/status" => {
-                                    let _ = tg.send_message(&format!(
-                                        "🐾 *unthinkclaw status:*\n\n\
+                                    let _ = tg
+                                        .send_message(&format!(
+                                            "🐾 *unthinkclaw status:*\n\n\
                                         Model: `{}`\n\
                                         Tools: {}\n\
                                         Skills: {}\n\
                                         Channel: Telegram\n\
                                         PID: {}",
-                                        runner.get_model(),
-                                        runner.list_tools().await.len(),
-                                        discovered_skills.len(),
-                                        std::process::id(),
-                                    )).await;
+                                            runner.get_model(),
+                                            runner.list_tools().await.len(),
+                                            discovered_skills.len(),
+                                            std::process::id(),
+                                        ))
+                                        .await;
                                     continue;
                                 }
                                 "/reset" => {
                                     // Clear conversation history from SQLite
-                                    let _ = memory.forget("chat", &format!("conv_{}", msg.chat_id)).await;
-                                    let _ = tg.send_message("🗑 Conversation history cleared.").await;
+                                    let _ = memory
+                                        .forget("chat", &format!("conv_{}", msg.chat_id))
+                                        .await;
+                                    let _ =
+                                        tg.send_message("🗑 Conversation history cleared.").await;
                                     continue;
                                 }
                                 "/cost" => {
                                     let summary = runner.get_cost_summary().await;
                                     let mut by_model: Vec<_> = summary.by_model.iter().collect();
                                     by_model.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-                                    
+
                                     let model_breakdown = if by_model.is_empty() {
                                         "No usage yet.".to_string()
                                     } else {
-                                        by_model.iter()
-                                            .map(|(model, cost)| format!("  • {}: ${:.4}", model, cost))
+                                        by_model
+                                            .iter()
+                                            .map(|(model, cost)| {
+                                                format!("  • {}: ${:.4}", model, cost)
+                                            })
                                             .collect::<Vec<_>>()
                                             .join("\n")
                                     };
-                                    
-                                    let _ = tg.send_message(&format!(
-                                        "💰 *Cost Summary:*\n\n\
+
+                                    let _ = tg
+                                        .send_message(&format!(
+                                            "💰 *Cost Summary:*\n\n\
                                         Total: ${:.4}\n\
                                         Tokens: {}\n\
                                         Calls: {}\n\n\
                                         By model:\n{}",
-                                        summary.total_cost,
-                                        summary.total_tokens,
-                                        summary.call_count,
-                                        model_breakdown,
-                                    )).await;
+                                            summary.total_cost,
+                                            summary.total_tokens,
+                                            summary.call_count,
+                                            model_breakdown,
+                                        ))
+                                        .await;
                                     continue;
                                 }
                                 "/start" => {
-                                    let _ = tg.send_message(
-                                        "🐾 *unthinkclaw* — AI assistant\n\n\
+                                    let _ = tg
+                                        .send_message(
+                                            "🐾 *unthinkclaw* — AI assistant\n\n\
                                         Just type a message to chat.\n\
                                         Use /help for commands.\n\
-                                        Use /tools to see what I can do."
-                                    ).await;
+                                        Use /tools to see what I can do.",
+                                        )
+                                        .await;
                                     continue;
                                 }
                                 _ => {
@@ -627,12 +660,17 @@ async fn main() -> anyhow::Result<()> {
                                         if round == 0 || tool_count == 0 {
                                             break;
                                         }
-                                        format!("processing... round {} ({} tools)", round, tool_count)
+                                        format!(
+                                            "processing... round {} ({} tools)",
+                                            round, tool_count
+                                        )
                                     }
                                 };
-                                
+
                                 if progress_msg_id > 0 {
-                                    let _ = tg_progress.edit_message(progress_msg_id, &status_text).await;
+                                    let _ = tg_progress
+                                        .edit_message(progress_msg_id, &status_text)
+                                        .await;
                                 }
                             }
                         });
@@ -646,7 +684,7 @@ async fn main() -> anyhow::Result<()> {
                                 }).await;
                                 drop(progress_tx);
                                 let _ = progress_task.await;
-                                
+
                                 // Delete progress message
                                 if progress_msg_id > 0 {
                                     let _ = tg.delete_message(progress_msg_id).await;
@@ -657,9 +695,11 @@ async fn main() -> anyhow::Result<()> {
                             Err(e) => {
                                 drop(progress_tx);
                                 let _ = progress_task.await;
-                                
+
                                 if progress_msg_id > 0 {
-                                    let _ = tg.edit_message(progress_msg_id, &format!("❌ {}", e)).await;
+                                    let _ = tg
+                                        .edit_message(progress_msg_id, &format!("❌ {}", e))
+                                        .await;
                                 }
                             }
                         }
@@ -668,9 +708,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(feature = "channel-discord")]
                 "discord" => {
-                    let token = _discord_token.ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
-                    let channel_id =
-                        _discord_channel_id.ok_or_else(|| anyhow::anyhow!("--discord-channel-id required"))?;
+                    let token = _discord_token
+                        .ok_or_else(|| anyhow::anyhow!("--discord-token required"))?;
+                    let channel_id = _discord_channel_id
+                        .ok_or_else(|| anyhow::anyhow!("--discord-channel-id required"))?;
 
                     println!("unthinkclaw — {} via Discord", cfg.model);
                     println!("   Channel ID: {}", channel_id);
@@ -680,12 +721,19 @@ async fn main() -> anyhow::Result<()> {
                     runner.run(&mut ch).await?;
                 }
                 other => {
-                    anyhow::bail!("Unknown channel: {} (supported: cli, telegram, discord)", other);
+                    anyhow::bail!(
+                        "Unknown channel: {} (supported: cli, telegram, discord)",
+                        other
+                    );
                 }
             }
         }
 
-        Commands::Ask { message, config, model } => {
+        Commands::Ask {
+            message,
+            config,
+            model,
+        } => {
             let cfg = load_config(&config);
             let model = model.unwrap_or(cfg.model.clone());
             let provider = build_provider(&cfg);
@@ -701,21 +749,51 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 addr
             };
+            let workspace = cfg.workspace.clone();
             let auth_token = cfg
                 .gateway
                 .auth_token
                 .clone()
                 .or_else(|| std::env::var("UNTHINKCLAW_GATEWAY_TOKEN").ok())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let provider = build_provider(&cfg);
+            let policy = Arc::new(ExecutionPolicy::from_config(&cfg.policy));
+            let memory = build_memory_backend(&workspace, &cfg).await?;
+            let system_prompt = prompt::build_system_prompt(&workspace).await;
+            let discovered_skills = skills::discover_skills();
+            let state_path = default_state_path(&workspace, cfg.runtime.state_path.as_ref());
+            let hosted_runtime = Arc::new(
+                HostedRuntime::new(
+                    cfg.clone(),
+                    workspace,
+                    provider,
+                    memory,
+                    policy,
+                    system_prompt,
+                    discovered_skills,
+                    state_path,
+                )
+                .await?,
+            );
             println!("unthinkclaw Gateway — starting on {}", addr);
             println!("   API: http://{}/api/chat", addr);
             println!("   WebSocket: ws://{}/ws", addr);
             println!("   Bearer token: {}", auth_token);
             println!("   Admin API enabled: {}", cfg.gateway.enable_admin_api);
-            gateway::start_gateway(&addr, cfg.gateway.clone(), &auth_token).await?;
+            gateway::start_gateway_with_runtime(
+                &addr,
+                cfg.gateway.clone(),
+                &auth_token,
+                hosted_runtime,
+            )
+            .await?;
         }
 
-        Commands::Doctor { config, verbose, json } => {
+        Commands::Doctor {
+            config,
+            verbose,
+            json,
+        } => {
             let cfg = load_config(&config);
             let report = collect_doctor_report(Some(&cfg), verbose).await;
             if json {
@@ -756,7 +834,13 @@ async fn main() -> anyhow::Result<()> {
             let scheduler = CronScheduler::new(&db_path.to_string_lossy())?;
 
             match action {
-                CronAction::Add { name, schedule, task, channel, model } => {
+                CronAction::Add {
+                    name,
+                    schedule,
+                    task,
+                    channel,
+                    model,
+                } => {
                     let id = scheduler.add(&name, &schedule, &task, &channel, &model)?;
                     println!("Added cron job: {} (id: {})", name, id);
                 }
@@ -811,29 +895,45 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "swarm")]
             {
-                use unthinkclaw::swarm::{SurrealBackend, SwarmStorage, SwarmCoordinator, AgentCapability, TaskPriority};
                 use unthinkclaw::swarm::models::LinkDirection;
+                use unthinkclaw::swarm::{
+                    AgentCapability, SurrealBackend, SwarmCoordinator, SwarmStorage, TaskPriority,
+                };
 
                 let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
-                let surreal_path = workspace.join(".unthinkclaw/swarm.db");
+                let surreal_path = default_state_path(&workspace, None);
 
                 // Ensure directory exists
                 if let Some(parent) = surreal_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                let storage: Arc<dyn SwarmStorage> = Arc::new(SurrealBackend::new(&surreal_path).await?);
+                let storage: Arc<dyn SwarmStorage> =
+                    Arc::new(SurrealBackend::new(&surreal_path).await?);
                 let coordinator = SwarmCoordinator::new(storage.clone());
                 coordinator.init().await?;
 
                 match action {
-                    SwarmAction::Start { surreal_path: _, cache_path: _ } => {
-                        println!("Swarm coordinator initialized at {}", surreal_path.display());
+                    SwarmAction::Start {
+                        surreal_path: _,
+                        cache_path: _,
+                    } => {
+                        println!(
+                            "Swarm coordinator initialized at {}",
+                            surreal_path.display()
+                        );
                         println!("Ready for agent registration.");
                     }
 
-                    SwarmAction::AgentCreate { name, model, capabilities, tools, max_concurrent } => {
-                        let caps: Vec<AgentCapability> = capabilities.split(',')
+                    SwarmAction::AgentCreate {
+                        name,
+                        model,
+                        capabilities,
+                        tools,
+                        max_concurrent,
+                    } => {
+                        let caps: Vec<AgentCapability> = capabilities
+                            .split(',')
                             .filter_map(|c| match c.trim() {
                                 "coding" => Some(AgentCapability::Coding),
                                 "research" => Some(AgentCapability::Research),
@@ -847,14 +947,12 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .collect();
 
-                        let tool_list = tools.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+                        let tool_list =
+                            tools.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
-                        let agent_id = coordinator.register_agent(
-                            name.clone(),
-                            caps,
-                            Some(model.clone()),
-                            tool_list,
-                        ).await?;
+                        let agent_id = coordinator
+                            .register_agent(name.clone(), caps, Some(model.clone()), tool_list)
+                            .await?;
 
                         // Update max_concurrent
                         storage.update_agent_status(&agent_id, "active").await?;
@@ -864,53 +962,85 @@ async fn main() -> anyhow::Result<()> {
                         println!("  Max concurrent: {}", max_concurrent);
                     }
 
-                    SwarmAction::AgentLink { source, target, direction, max_concurrent } => {
+                    SwarmAction::AgentLink {
+                        source,
+                        target,
+                        direction,
+                        max_concurrent,
+                    } => {
                         let dir = match direction.as_str() {
                             "outbound" => LinkDirection::Outbound,
                             "inbound" => LinkDirection::Inbound,
                             "bidirectional" | "bidi" => LinkDirection::Bidirectional,
                             _ => {
-                                eprintln!("Unknown direction: {} (use: outbound, inbound, bidirectional)", direction);
+                                eprintln!(
+                                    "Unknown direction: {} (use: outbound, inbound, bidirectional)",
+                                    direction
+                                );
                                 std::process::exit(1);
                             }
                         };
 
                         // Resolve names to IDs
-                        let src = storage.get_agent_by_name(&source).await?
+                        let src = storage
+                            .get_agent_by_name(&source)
+                            .await?
                             .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", source))?;
-                        let tgt = storage.get_agent_by_name(&target).await?
+                        let tgt = storage
+                            .get_agent_by_name(&target)
+                            .await?
                             .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", target))?;
 
-                        let link = coordinator.delegation.create_link(
-                            &src.agent_id, &tgt.agent_id, dir, max_concurrent,
-                        ).await?;
+                        let link = coordinator
+                            .delegation
+                            .create_link(&src.agent_id, &tgt.agent_id, dir, max_concurrent)
+                            .await?;
 
-                        println!("Link created: {} -> {} ({}, max {})",
-                            source, target, direction, max_concurrent);
+                        println!(
+                            "Link created: {} -> {} ({}, max {})",
+                            source, target, direction, max_concurrent
+                        );
                         println!("  Link ID: {}", link.link_id);
                     }
 
                     SwarmAction::TeamCreate { name, lead } => {
-                        let lead_agent = storage.get_agent_by_name(&lead).await?
+                        let lead_agent = storage
+                            .get_agent_by_name(&lead)
+                            .await?
                             .ok_or_else(|| anyhow::anyhow!("Lead agent '{}' not found", lead))?;
 
-                        let team = coordinator.teams.create_team(&name, &lead_agent.agent_id).await?;
+                        let team = coordinator
+                            .teams
+                            .create_team(&name, &lead_agent.agent_id)
+                            .await?;
                         println!("Team '{}' created (id: {})", name, team.team_id);
                         println!("  Lead: {}", lead);
                     }
 
-                    SwarmAction::TeamTaskAdd { team, subject, priority, blocked_by } => {
-                        let team_obj = coordinator.teams.get_team_by_name(&team).await?
+                    SwarmAction::TeamTaskAdd {
+                        team,
+                        subject,
+                        priority,
+                        blocked_by,
+                    } => {
+                        let team_obj = coordinator
+                            .teams
+                            .get_team_by_name(&team)
+                            .await?
                             .ok_or_else(|| anyhow::anyhow!("Team '{}' not found", team))?;
 
                         let blockers = blocked_by
                             .map(|b| b.split(',').map(|s| s.trim().to_string()).collect())
                             .unwrap_or_default();
 
-                        let task = coordinator.teams.create_task(
-                            &team_obj.team_id, &subject, None, priority, blockers,
-                        ).await?;
-                        println!("Task added to team '{}': {} (id: {})", team, subject, task.task_id);
+                        let task = coordinator
+                            .teams
+                            .create_task(&team_obj.team_id, &subject, None, priority, blockers)
+                            .await?;
+                        println!(
+                            "Task added to team '{}': {} (id: {})",
+                            team, subject, task.task_id
+                        );
                     }
 
                     SwarmAction::Agents => {
@@ -918,9 +1048,13 @@ async fn main() -> anyhow::Result<()> {
                         if agents.is_empty() {
                             println!("No agents registered.");
                         } else {
-                            println!("{:<20} {:<12} {:<25} {:<10}", "NAME", "STATUS", "MODEL", "MAX_CONC");
+                            println!(
+                                "{:<20} {:<12} {:<25} {:<10}",
+                                "NAME", "STATUS", "MODEL", "MAX_CONC"
+                            );
                             for a in &agents {
-                                println!("{:<20} {:<12} {:<25} {:<10}",
+                                println!(
+                                    "{:<20} {:<12} {:<25} {:<10}",
                                     a.name,
                                     a.status.to_string(),
                                     a.model.as_deref().unwrap_or("-"),
@@ -936,7 +1070,12 @@ async fn main() -> anyhow::Result<()> {
                             println!("No pending tasks.");
                         } else {
                             for t in &tasks {
-                                println!("[{:?}] {} — {}", t.priority, t.title, t.status.to_string());
+                                println!(
+                                    "[{:?}] {} — {}",
+                                    t.priority,
+                                    t.title,
+                                    t.status.to_string()
+                                );
                             }
                         }
                     }
@@ -948,27 +1087,43 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             for t in &teams {
                                 let members = coordinator.teams.list_members(&t.team_id).await?;
-                                println!("{} (lead: {}, members: {}, status: {})",
-                                    t.name, t.lead_agent_id, members.len(), t.status);
+                                println!(
+                                    "{} (lead: {}, members: {}, status: {})",
+                                    t.name,
+                                    t.lead_agent_id,
+                                    members.len(),
+                                    t.status
+                                );
                             }
                         }
                     }
 
                     SwarmAction::Delegations { agent } => {
-                        let agent_obj = storage.get_agent_by_name(&agent).await?
+                        let agent_obj = storage
+                            .get_agent_by_name(&agent)
+                            .await?
                             .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent))?;
-                        let delegations = coordinator.delegation.list_active(&agent_obj.agent_id).await?;
+                        let delegations = coordinator
+                            .delegation
+                            .list_active(&agent_obj.agent_id)
+                            .await?;
                         if delegations.is_empty() {
                             println!("No active delegations for '{}'.", agent);
                         } else {
                             for d in &delegations {
-                                println!("[{}] {} -> {} ({:?}): {}",
-                                    d.status, d.source_agent_id, d.target_agent_id, d.mode, d.task);
+                                println!(
+                                    "[{}] {} -> {} ({:?}): {}",
+                                    d.status, d.source_agent_id, d.target_agent_id, d.mode, d.task
+                                );
                             }
                         }
                     }
 
-                    SwarmAction::Task { description, priority, title } => {
+                    SwarmAction::Task {
+                        description,
+                        priority,
+                        title,
+                    } => {
                         let prio = match priority.as_str() {
                             "low" => TaskPriority::Low,
                             "medium" => TaskPriority::Medium,
@@ -976,8 +1131,16 @@ async fn main() -> anyhow::Result<()> {
                             "critical" => TaskPriority::Critical,
                             _ => TaskPriority::Medium,
                         };
-                        let title = title.unwrap_or_else(|| description.lines().next().unwrap_or(&description).to_string());
-                        let task_id = coordinator.submit_task(title.clone(), description, prio).await?;
+                        let title = title.unwrap_or_else(|| {
+                            description
+                                .lines()
+                                .next()
+                                .unwrap_or(&description)
+                                .to_string()
+                        });
+                        let task_id = coordinator
+                            .submit_task(title.clone(), description, prio)
+                            .await?;
                         println!("Task submitted: {} (id: {})", title, task_id);
                     }
 
@@ -1024,10 +1187,14 @@ fn load_config(path: &str) -> Config {
         }
         #[cfg(feature = "provider-anthropic")]
         {
-            if let Ok(_provider) = unthinkclaw::providers::anthropic::AnthropicProvider::from_env_or_oauth() {
+            if let Ok(_provider) =
+                unthinkclaw::providers::anthropic::AnthropicProvider::from_env_or_oauth()
+            {
                 // Fallback to Claude.dev credentials file
                 let _ = _provider; // Just checking it exists
-                if let Ok((token, _, _)) = unthinkclaw::providers::oauth::load_oauth_token_from_file() {
+                if let Ok((token, _, _)) =
+                    unthinkclaw::providers::oauth::load_oauth_token_from_file()
+                {
                     cfg.provider.api_key = Some(token);
                     cfg.model = "claude-sonnet-4-5".to_string();
                 }
@@ -1082,7 +1249,11 @@ fn resolve_openclaw_token(provider: &str) -> anyhow::Result<String> {
                 if p == provider {
                     if let Some(token) = value["token"].as_str() {
                         if !token.is_empty() {
-                            tracing::info!("Loaded {} token from OpenClaw profile {}", provider, key);
+                            tracing::info!(
+                                "Loaded {} token from OpenClaw profile {}",
+                                provider,
+                                key
+                            );
                             return Ok(token.to_string());
                         }
                     }
@@ -1097,7 +1268,10 @@ fn resolve_openclaw_token(provider: &str) -> anyhow::Result<String> {
         }
     }
 
-    Err(anyhow::anyhow!("No {} credentials in auth-profiles", provider))
+    Err(anyhow::anyhow!(
+        "No {} credentials in auth-profiles",
+        provider
+    ))
 }
 
 fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
@@ -1117,12 +1291,18 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
             if let Ok(p) = unthinkclaw::providers::copilot::CopilotProvider::from_openclaw() {
                 Arc::new(p)
             } else {
-                Arc::new(unthinkclaw::providers::copilot::CopilotProvider::new(&api_key))
+                Arc::new(unthinkclaw::providers::copilot::CopilotProvider::new(
+                    &api_key,
+                ))
             }
         }
         #[cfg(feature = "provider-ollama")]
         "ollama" => {
-            let url = cfg.provider.base_url.clone().unwrap_or_else(|| "http://localhost:11434".into());
+            let url = cfg
+                .provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "http://localhost:11434".into());
             Arc::new(OllamaProvider::new(url))
         }
         // All OpenAI-compatible providers (always available)
@@ -1143,24 +1323,79 @@ fn build_provider(cfg: &Config) -> Arc<dyn Provider> {
         "minimax" => Arc::new(OpenAiCompatProvider::minimax(&api_key)),
         "vercel" => Arc::new(OpenAiCompatProvider::vercel(&api_key)),
         other => {
-            let base = cfg.provider.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".into());
+            let base = cfg
+                .provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".into());
             Arc::new(OpenAiCompatProvider::new(&api_key, base, other))
         }
     }
 }
 
-async fn build_memory_backend(workspace: &PathBuf) -> anyhow::Result<Arc<dyn MemoryBackend>> {
-    #[cfg(feature = "swarm")]
-    {
-        let surreal_path = workspace.join(".unthinkclaw/memory.surreal");
-        if let Ok(memory) =
-            unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path()).await
-        {
-            return Ok(Arc::new(memory));
+fn build_base_tools(workspace: &PathBuf, policy: Arc<ExecutionPolicy>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(ShellTool::new(workspace.clone(), Arc::clone(&policy))),
+        Arc::new(FileReadTool::new(workspace.clone())),
+        Arc::new(FileWriteTool::new(workspace.clone())),
+        Arc::new(unthinkclaw::tools::edit::EditTool::new(workspace.clone())),
+        Arc::new(MemorySearchTool::new(workspace.clone())),
+        Arc::new(MemoryGetTool::new(workspace.clone())),
+        Arc::new(unthinkclaw::tools::web_search::WebSearchTool::new()),
+        Arc::new(unthinkclaw::tools::web_fetch::WebFetchTool::new()),
+        Arc::new(unthinkclaw::tools::doctor::DoctorTool::new()),
+        Arc::new(unthinkclaw::tools::session::ListModelsTool::new()),
+        Arc::new(unthinkclaw::tools::dynamic::CreateToolTool::new(
+            Arc::clone(&policy),
+        )),
+        Arc::new(unthinkclaw::tools::dynamic::ListCustomToolsTool::new()),
+        Arc::new(unthinkclaw::tools::browser::BrowserTool::new()),
+        Arc::new(unthinkclaw::tools::mcp::McpTool::new()),
+    ]
+}
+
+async fn build_memory_backend(
+    workspace: &PathBuf,
+    cfg: &Config,
+) -> anyhow::Result<Arc<dyn MemoryBackend>> {
+    let storage_root = workspace.join(&cfg.storage.root);
+    std::fs::create_dir_all(&storage_root)?;
+    let backend = cfg.storage.backend.trim().to_ascii_lowercase();
+
+    match backend.as_str() {
+        "sqlite" => Ok(Arc::new(SqliteMemory::new(
+            &storage_root.join("memory.db").to_string_lossy(),
+        )?)),
+        "surreal" => {
+            #[cfg(feature = "swarm")]
+            {
+                let surreal_path = storage_root.join("memory.surreal");
+                let memory =
+                    unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path())
+                        .await?;
+                Ok(Arc::new(memory))
+            }
+            #[cfg(not(feature = "swarm"))]
+            {
+                anyhow::bail!(
+                    "storage.backend=surreal requires the 'swarm' feature (SurrealDB + RocksDB)"
+                );
+            }
+        }
+        _ => {
+            #[cfg(feature = "swarm")]
+            {
+                let surreal_path = storage_root.join("memory.surreal");
+                if let Ok(memory) =
+                    unthinkclaw::memory::surreal::SurrealMemory::new(surreal_path.as_path()).await
+                {
+                    return Ok(Arc::new(memory));
+                }
+            }
+
+            Ok(Arc::new(SqliteMemory::new(
+                &storage_root.join("memory.db").to_string_lossy(),
+            )?))
         }
     }
-
-    Ok(Arc::new(SqliteMemory::new(
-        &workspace.join(".unthinkclaw/memory.db").to_string_lossy(),
-    )?))
 }

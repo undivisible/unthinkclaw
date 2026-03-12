@@ -11,7 +11,7 @@ name = "unthinkclaw"
 path = "src/main.rs"
 
 [features]
-default = ["core", "channel-cli", "channel-telegram", "provider-anthropic"]
+default = ["core", "channel-cli", "channel-telegram", "provider-anthropic", "swarm"]
 
 # Core (always needed)
 core = []
@@ -128,4 +128,3 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit
 strip = true        # Strip symbols
 panic = "abort"     # No unwind tables
-

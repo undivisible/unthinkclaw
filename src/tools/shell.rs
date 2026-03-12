@@ -85,7 +85,7 @@ impl Tool for ShellTool {
             || (cmd_lower.contains("kill") && cmd_lower.contains("unthinkclaw"))
         {
             return Ok(ToolResult::error(
-                "⚠️ Cannot restart/kill yourself mid-conversation. Use /restart command instead."
+                "⚠️ Cannot restart/kill yourself mid-conversation. Use /restart command instead.",
             ));
         }
 

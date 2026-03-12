@@ -10,7 +10,9 @@ pub struct Config {
     pub model: String,
     pub system_prompt: String,
     pub workspace: PathBuf,
+    pub storage: StorageConfig,
     pub runtime: RuntimeConfig,
+    pub hosting: HostingConfig,
     pub channel: ChannelConfig,
     pub gateway: GatewayConfig,
     pub policy: PolicyConfig,
@@ -30,6 +32,23 @@ pub struct RuntimeConfig {
     pub kind: String, // "native", "docker"
     pub docker_image: Option<String>,
     pub memory_limit_mb: Option<u64>,
+    pub state_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub backend: String, // "surreal" | "sqlite" | "auto"
+    pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostingConfig {
+    pub enabled: bool,
+    pub tenant_root: PathBuf,
+    pub session_timeout_minutes: u64,
+    pub default_channel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +64,11 @@ pub struct GatewayConfig {
     pub bind: String,
     pub auth_token: Option<String>,
     pub enable_admin_api: bool,
+    pub request_body_limit_kb: usize,
+    pub request_timeout_secs: u64,
+    pub rate_limit_per_minute: usize,
+    pub trusted_proxies: Vec<String>,
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,11 +97,14 @@ impl Config {
             model: "claude-sonnet-4-5".to_string(),
             system_prompt: "You are a helpful AI assistant.".to_string(),
             workspace: PathBuf::from("."),
+            storage: StorageConfig::default(),
             runtime: RuntimeConfig {
                 kind: "native".to_string(),
                 docker_image: None,
                 memory_limit_mb: None,
+                state_path: None,
             },
+            hosting: HostingConfig::default(),
             channel: ChannelConfig {
                 kind: "cli".to_string(),
                 token: None,
@@ -110,6 +137,27 @@ impl Default for RuntimeConfig {
             kind: "native".to_string(),
             docker_image: None,
             memory_limit_mb: None,
+            state_path: None,
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "surreal".to_string(),
+            root: PathBuf::from(".unthinkclaw"),
+        }
+    }
+}
+
+impl Default for HostingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tenant_root: PathBuf::from(".unthinkclaw/tenants"),
+            session_timeout_minutes: 120,
+            default_channel: "gateway".to_string(),
         }
     }
 }
@@ -129,6 +177,11 @@ impl Default for GatewayConfig {
             bind: "127.0.0.1:8080".to_string(),
             auth_token: None,
             enable_admin_api: false,
+            request_body_limit_kb: 512,
+            request_timeout_secs: 60,
+            rate_limit_per_minute: 120,
+            trusted_proxies: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 }

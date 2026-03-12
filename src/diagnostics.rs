@@ -138,6 +138,42 @@ pub fn audit_config(cfg: &Config) -> Vec<Finding> {
         });
     }
 
+    if cfg.gateway.rate_limit_per_minute == 0 {
+        findings.push(Finding {
+            code: "gateway_rate_limit_disabled",
+            severity: Severity::Warn,
+            title: "Gateway rate limiting is disabled",
+            detail: "gateway.rate_limit_per_minute is 0, so authenticated clients can send unlimited requests.".into(),
+            remediation: Some("Set a sane per-minute request limit for hosted deployments.".into()),
+        });
+    }
+
+    if cfg.gateway.request_timeout_secs > 300 {
+        findings.push(Finding {
+            code: "gateway_timeout_high",
+            severity: Severity::Warn,
+            title: "Gateway request timeout is unusually high",
+            detail: format!(
+                "gateway.request_timeout_secs is set to {} seconds.",
+                cfg.gateway.request_timeout_secs
+            ),
+            remediation: Some(
+                "Keep request timeouts bounded to reduce stuck sessions and resource exhaustion."
+                    .into(),
+            ),
+        });
+    }
+
+    if !is_loopback && cfg.gateway.allowed_origins.is_empty() {
+        findings.push(Finding {
+            code: "gateway_origins_unrestricted",
+            severity: Severity::Warn,
+            title: "Gateway allowed origins are unrestricted",
+            detail: "The gateway is not loopback-only and gateway.allowed_origins is empty.".into(),
+            remediation: Some("Set explicit allowed origins when exposing the gateway behind a browser-facing frontend.".into()),
+        });
+    }
+
     if cfg.policy.allow_shell {
         findings.push(Finding {
             code: "policy_shell_enabled",
@@ -266,6 +302,18 @@ pub async fn collect_doctor_report(cfg: Option<&Config>, verbose: bool) -> Docto
         name: "Gateway bind".into(),
         ok: is_loopback_bind(cfg.gateway.bind.trim()),
         detail: cfg.gateway.bind.clone(),
+    });
+
+    checks.push(Check {
+        name: "Gateway rate limit".into(),
+        ok: cfg.gateway.rate_limit_per_minute > 0,
+        detail: format!("{} req/min", cfg.gateway.rate_limit_per_minute),
+    });
+
+    checks.push(Check {
+        name: "Gateway timeout".into(),
+        ok: cfg.gateway.request_timeout_secs > 0,
+        detail: format!("{}s", cfg.gateway.request_timeout_secs),
     });
 
     DoctorReport {
