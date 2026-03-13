@@ -2,6 +2,13 @@
 
 Scope: entire repository.
 
+## Branch Posture
+
+- This branch is the hosted and multi-user platform variant.
+- `main` is the device-first runtime branch.
+- Web UI, gateway, deployment manifests, and hosted session surfaces belong
+  here rather than on `main`.
+
 ## 1) Project Snapshot
 
 unthinkclaw is a lean, fast Rust AI agent runtime — Telegram-first, trait-driven, SQLite-backed.
