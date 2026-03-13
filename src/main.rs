@@ -491,13 +491,52 @@ async fn main() -> anyhow::Result<()> {
                     println!("unthinkclaw — {} via Telegram", cfg.model);
                     println!("   Chat ID: {}", chat_id);
                     println!("   Tools: {}", runner.list_tools().await.join(", "));
+                    println!("   API: http://127.0.0.1:31337/message");
                     println!("   Listening for messages...");
                     let mut ch = TelegramChannel::new(token, chat_id);
                     let mut rx = ch.start().await?;
 
+                    // Local HTTP API for CLI → bot messaging
+                    let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<unthinkclaw::channels::IncomingMessage>(32);
+                    {
+                        let chat_id_clone = chat_id.to_string();
+                        tokio::spawn(async move {
+                            use axum::{Router, routing::post, Json, extract::State};
+
+                            let app = Router::new()
+                                .route("/message", post(|State(tx): State<tokio::sync::mpsc::Sender<unthinkclaw::channels::IncomingMessage>>, Json(body): Json<serde_json::Value>| async move {
+                                    let text = body["message"].as_str().unwrap_or("").to_string();
+                                    if text.is_empty() {
+                                        return (axum::http::StatusCode::BAD_REQUEST, "missing 'message' field");
+                                    }
+                                    let msg = unthinkclaw::channels::IncomingMessage {
+                                        id: format!("cli-{}", chrono::Utc::now().timestamp()),
+                                        chat_id: chat_id_clone.clone(),
+                                        sender_id: "cli".to_string(),
+                                        sender_name: Some("CLI".to_string()),
+                                        text,
+                                        timestamp: chrono::Utc::now(),
+                                        is_group: false,
+                                        reply_to: None,
+                                    };
+                                    let _ = tx.send(msg).await;
+                                    (axum::http::StatusCode::OK, "queued")
+                                }))
+                                .with_state(cli_tx);
+
+                            let listener = tokio::net::TcpListener::bind("127.0.0.1:31337").await.unwrap();
+                            axum::serve(listener, app).await.unwrap();
+                        });
+                    }
+
                     let processing = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-                    while let Some(msg) = rx.recv().await {
+                    loop {
+                    let msg = tokio::select! {
+                        Some(msg) = rx.recv() => msg,
+                        Some(msg) = cli_rx.recv() => msg,
+                        else => break,
+                    };
                         let text = msg.text.trim();
 
                         // If we're processing and this isn't a command, steer
@@ -1000,41 +1039,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Message { message, chat_id, workspace } => {
-            let ws = workspace.unwrap_or_else(|| PathBuf::from("."));
-            let env_path = ws.join(".env");
-
-            // Load .env
-            if env_path.exists() {
-                let env_content = std::fs::read_to_string(&env_path)?;
-                for line in env_content.lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        let v = v.trim().trim_matches('"');
-                        std::env::set_var(k.trim(), v);
-                    }
-                }
-            }
-
-            let token = std::env::var("UNTHINKCLAW_TELEGRAM_TOKEN")
-                .map_err(|_| anyhow::anyhow!("UNTHINKCLAW_TELEGRAM_TOKEN not set. Run from workspace dir or pass --workspace"))?;
-            let chat_id = chat_id
-                .or_else(|| std::env::var("UNTHINKCLAW_CHAT_ID").ok())
-                .ok_or_else(|| anyhow::anyhow!("Chat ID not set. Use --chat-id or set UNTHINKCLAW_CHAT_ID"))?;
-
+        Commands::Message { message, chat_id: _, workspace: _ } => {
             let client = reqwest::Client::new();
-            let resp = client.post(format!("https://api.telegram.org/bot{}/sendMessage", token))
-                .json(&serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": message,
-                }))
+            let resp = client.post("http://127.0.0.1:31337/message")
+                .json(&serde_json::json!({ "message": message }))
                 .send()
-                .await?;
+                .await;
 
-            let body: serde_json::Value = resp.json().await?;
-            if body["ok"].as_bool() == Some(true) {
-                println!("✅ Sent to chat {}", chat_id);
-            } else {
-                eprintln!("❌ {}", body);
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("✅ Sent to unthinkclaw");
+                }
+                Ok(r) => {
+                    eprintln!("❌ HTTP {}: {}", r.status(), r.text().await.unwrap_or_default());
+                }
+                Err(_) => {
+                    eprintln!("❌ Can't reach unthinkclaw. Is it running? (systemctl --user status unthinkclaw)");
+                }
             }
         }
 
