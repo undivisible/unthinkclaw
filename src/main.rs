@@ -1436,19 +1436,23 @@ fn init_tracing(cfg: &unthinkclaw::config::ObservabilityConfig) -> anyhow::Resul
 }
 
 fn load_config(path: &str) -> Config {
-    Config::load(path).unwrap_or_else(|_| {
+    let mut cfg = Config::load(path).unwrap_or_else(|_| {
         tracing::warn!("Config not found at {}, using defaults", path);
-        let mut cfg = Config::default_config();
-        // Try env vars first, then OpenClaw auth-profiles, then Claude.dev credentials
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            cfg.provider.api_key = Some(key.clone());
-            // OAuth tokens need compatible model names
-            if key.contains("sk-ant-oat") {
-                cfg.model = "claude-sonnet-4-5".to_string();
-            }
-        } else if let Ok(token) = resolve_openclaw_token("anthropic") {
+        Config::default_config()
+    });
+
+    // Env always wins — override api_key from ANTHROPIC_API_KEY if set
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        cfg.provider.api_key = Some(key.clone());
+        if key.contains("sk-ant-oat") && cfg.model.is_empty() {
+            cfg.model = "claude-sonnet-4-5".to_string();
+        }
+    }
+
+    if cfg.provider.api_key.is_none() {
+        if let Ok(token) = resolve_openclaw_token("anthropic") {
             cfg.provider.api_key = Some(token);
-            cfg.model = "claude-sonnet-4-5".to_string(); // OAuth-compatible model
+            if cfg.model.is_empty() { cfg.model = "claude-sonnet-4-5".to_string(); }
         }
         #[cfg(feature = "provider-anthropic")]
         {
@@ -1472,8 +1476,9 @@ fn load_config(path: &str) -> Config {
                 cfg.provider.api_key = Some(key);
             }
         }
-        cfg
-    })
+    }
+
+    cfg
 }
 
 /// Resolve token from OpenClaw's auth-profiles.json
