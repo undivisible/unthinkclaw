@@ -2,6 +2,13 @@
 
 Scope: entire repository.
 
+## Branch Posture
+
+- `main` is the device-first runtime branch.
+- Hosted gateway, web UI, and deployment work belong on `codex/full-platform`.
+- Keep this branch focused on the local bot that a user can run on their own
+  machine without the hosted control-plane surface.
+
 ## 1) Project Snapshot
 
 unthinkclaw is a lean, fast Rust AI agent runtime — Telegram-first, trait-driven, SQLite-backed.

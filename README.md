@@ -2,6 +2,13 @@
 
 Device-first Rust agent runtime. Unthink everything.
 
+## Branches
+
+- `main` is the local-first bot branch for running unthinkclaw directly on your
+  own device.
+- `codex/full-platform` keeps the hosted gateway, web app, and deployment
+  manifests for the multi-user platform version.
+
 ## Features
 
 - Multi-provider (Anthropic, OpenAI, Ollama, OpenRouter, ...)
@@ -28,6 +35,3 @@ cargo build --release
 
 Create `unthinkclaw.json` with `unthinkclaw init`, then set `ANTHROPIC_API_KEY`
 (or the relevant provider key) in your environment.
-
-The hosted web/app stack lives on the `codex/full-platform` branch. This branch
-is kept focused on the local bot runtime.
