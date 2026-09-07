@@ -337,7 +337,10 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
                 success: false,
             });
         }
-        rx4::Event::MessageEnd { role, content } if matches!(role, Role::User) => {
+        rx4::Event::MessageEnd {
+            role: Role::User,
+            content,
+        } => {
             if let Some((action, source)) = infer_recovery_from_user_text(content) {
                 record_recovery_action(recorder, &action, source);
             }
