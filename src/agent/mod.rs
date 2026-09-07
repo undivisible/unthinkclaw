@@ -20,7 +20,8 @@ pub use build_runner::{
 pub use loop_runner::AgentRunner;
 pub use mode::{agent_mode_from_permission_profile, AgentMode, NullChannel};
 pub use rotary_bridge::{
-    apply_recorded_steps, build_rx4_skill_engine, chat_message_to_rx4, record_rx4_event,
+    apply_recorded_steps, build_rx4_skill_engine, chat_message_to_rx4, record_failure_notice,
+    record_recovery_action, record_rx4_event, record_rx4_event_value, record_spill_notice,
     register_apollo_tools, runtime_pty_worker, rx4_message_to_chat, RotaryAgentBridge,
     RotaryBridgeConfig, RotaryProviderAdapter, Rx4TrajectoryRecorder, ToolHookContext,
 };

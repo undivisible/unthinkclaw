@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use apollo::agent::hooks::PermissionHook;
 use apollo::agent::mode::NullChannel;
 use apollo::agent::rotary_bridge::{
-    record_rx4_event, runtime_pty_worker, RotaryAgentBridge, RotaryBridgeConfig,
-    Rx4TrajectoryRecorder, ToolHookContext,
+    record_recovery_action, record_rx4_event, record_rx4_event_value, record_spill_notice,
+    runtime_pty_worker, RotaryAgentBridge, RotaryBridgeConfig, Rx4TrajectoryRecorder,
+    ToolHookContext,
 };
 use apollo::agent::AgentRunner;
 use apollo::channels::IncomingMessage;
@@ -636,4 +637,106 @@ fn rx4_spilled_tool_result_records_a_spill_step() {
         .find(|step| step.action.as_deref() == Some("spill"))
         .expect("spill step missing");
     assert_eq!(spill.observation.as_deref(), Some(spilled.locator.as_str()));
+}
+
+#[test]
+fn rx4_recovery_actions_are_recorded_on_the_trajectory() {
+    let mut recorder = Rx4TrajectoryRecorder::default();
+    record_recovery_action(&mut recorder, &rx4::recover_empty_turn(0, 3), "empty_turn");
+    record_recovery_action(&mut recorder, &rx4::recover_empty_turn(1, 3), "empty_turn");
+    record_recovery_action(&mut recorder, &rx4::recover_stuck_tool(0, 3), "stuck_tool");
+    record_recovery_action(&mut recorder, &rx4::RecoveryAction::Retry, "stuck_tool");
+    let (steps, _) = recorder.take_steps();
+    let actions: Vec<_> = steps
+        .iter()
+        .filter_map(|step| step.action.as_deref())
+        .collect();
+    assert_eq!(actions, ["prefill", "nudge", "stuck_tool", "stuck_tool"]);
+    assert_eq!(steps[2].action_args.as_deref(), Some("nudge"));
+    assert_eq!(steps[3].action_args.as_deref(), Some("retry"));
+}
+
+#[test]
+fn rx4_typed_notice_values_are_recorded_on_the_trajectory() {
+    let mut recorder = Rx4TrajectoryRecorder::default();
+    record_rx4_event_value(
+        &mut recorder,
+        &serde_json::json!({"type": "Prefill", "text": "continue"}),
+    );
+    record_rx4_event_value(
+        &mut recorder,
+        &serde_json::json!({"type": "Nudge", "text": "answer"}),
+    );
+    record_rx4_event_value(
+        &mut recorder,
+        &serde_json::json!({
+            "type": "StuckTool",
+            "action": "Halt",
+            "text": "stuck tool repeated 2 times (halt after 3)"
+        }),
+    );
+    record_rx4_event_value(
+        &mut recorder,
+        &serde_json::json!({"type": "SpillNotice", "locator": ".rx4/spill/out.txt"}),
+    );
+    record_rx4_event_value(
+        &mut recorder,
+        &serde_json::json!({"type": "FailureNotice", "message": "bounded write failed"}),
+    );
+    record_spill_notice(&mut recorder, "file://already-mapped");
+    let (steps, _) = recorder.take_steps();
+    let actions: Vec<_> = steps
+        .iter()
+        .filter_map(|step| step.action.as_deref())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "prefill",
+            "nudge",
+            "stuck_tool",
+            "spill",
+            "failure",
+            "spill"
+        ]
+    );
+    assert_eq!(steps[2].action_args.as_deref(), Some("halt"));
+    assert!(!steps[2].success);
+    assert_eq!(steps[3].observation.as_deref(), Some(".rx4/spill/out.txt"));
+}
+
+#[test]
+fn rx4_current_pin_recovery_signals_are_recorded() {
+    let mut recorder = Rx4TrajectoryRecorder::default();
+    let prefill = match rx4::recover_empty_turn(0, 3) {
+        rx4::RecoveryAction::Prefill(text) => text,
+        other => panic!("expected prefill, got {other:?}"),
+    };
+    record_rx4_event(
+        &mut recorder,
+        &rx4::Event::MessageEnd {
+            role: rx4::Role::User,
+            content: prefill,
+        },
+    );
+    record_rx4_event(
+        &mut recorder,
+        &rx4::Event::RetryReason {
+            retry_reason: "stuck_tool".into(),
+            layer: "tool".into(),
+        },
+    );
+    record_rx4_event(
+        &mut recorder,
+        &rx4::Event::GuardrailStop {
+            tool: "turn".into(),
+            reason: "empty turn limit reached (2/3)".into(),
+        },
+    );
+    let (steps, _) = recorder.take_steps();
+    let actions: Vec<_> = steps
+        .iter()
+        .filter_map(|step| step.action.as_deref())
+        .collect();
+    assert_eq!(actions, ["prefill", "stuck_tool", "halt"]);
 }
