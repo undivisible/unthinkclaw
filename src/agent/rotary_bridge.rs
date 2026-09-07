@@ -20,7 +20,7 @@ use std::sync::Arc;
 use rx4::provider::{
     Message, Provider as Rx4Provider, ProviderError as Rx4ProviderError, Role, StreamEvent,
 };
-use rx4::{recover_empty_turn, recover_stuck_tool, RecoveryAction};
+use rx4::{RecoveryAction, RecoveryKind, SpillStatus};
 
 use crate::agent::hooks::{run_post_hooks, run_pre_hooks, HookDecision, ToolHook};
 use crate::agent::stream::{emit, AgentStreamEvent, AgentStreamTx};
@@ -208,7 +208,6 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
                 .pending
                 .take()
                 .unwrap_or_else(|| ("tool".to_string(), String::new()));
-            let spill = spill_locator(&result.content).map(str::to_string);
             recorder.steps.push(TrajectoryStep {
                 step: recorder.steps.len() + 1,
                 thought: None,
@@ -218,20 +217,14 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
                 response: None,
                 success: !result.is_error,
             });
-            if let Some(locator) = spill {
-                record_spill_notice(recorder, locator);
+            if result.spill.is_none() {
+                if let Some(locator) = spill_locator(&result.content) {
+                    record_spill_notice(recorder, locator);
+                }
             }
         }
         rx4::Event::GuardrailWarning { tool, reason }
         | rx4::Event::GuardrailStop { tool, reason } => {
-            if tool == "turn" {
-                record_recovery_action(
-                    recorder,
-                    &RecoveryAction::Halt(reason.clone()),
-                    "empty_turn",
-                );
-                return;
-            }
             recorder.steps.push(TrajectoryStep {
                 step: recorder.steps.len() + 1,
                 thought: None,
@@ -268,17 +261,6 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
             retry_reason,
             layer,
         } => {
-            if layer == "tool"
-                && (retry_reason == "stuck_tool" || retry_reason.starts_with("stuck tool"))
-            {
-                let action = if retry_reason == "stuck_tool" {
-                    RecoveryAction::Retry
-                } else {
-                    RecoveryAction::Halt(retry_reason.clone())
-                };
-                record_recovery_action(recorder, &action, "stuck_tool");
-                return;
-            }
             recorder.steps.push(TrajectoryStep {
                 step: recorder.steps.len() + 1,
                 thought: None,
@@ -287,6 +269,44 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
                 observation: Some(retry_reason.clone()),
                 response: None,
                 success: false,
+            });
+        }
+        rx4::Event::Recovery { action, reason } => {
+            record_recovery_kind(recorder, *action, reason);
+        }
+        rx4::Event::ToolSpill {
+            status,
+            locator,
+            original_bytes,
+        } => {
+            record_tool_spill(recorder, *status, locator, *original_bytes);
+        }
+        rx4::Event::ProcessStart {
+            process_id,
+            program,
+        } => {
+            recorder.steps.push(TrajectoryStep {
+                step: recorder.steps.len() + 1,
+                thought: None,
+                action: Some("process_start".to_string()),
+                action_args: Some(process_id.clone()),
+                observation: Some(program.clone()),
+                response: None,
+                success: true,
+            });
+        }
+        rx4::Event::ProcessEnd {
+            process_id,
+            exit_code,
+        } => {
+            recorder.steps.push(TrajectoryStep {
+                step: recorder.steps.len() + 1,
+                thought: None,
+                action: Some("process_end".to_string()),
+                action_args: Some(process_id.clone()),
+                observation: Some(exit_code.map(|code| code.to_string()).unwrap_or_default()),
+                response: None,
+                success: !matches!(exit_code, Some(code) if *code != 0),
             });
         }
         rx4::Event::ProcessStdin { process_id, bytes } => {
@@ -336,14 +356,6 @@ pub fn record_rx4_event(recorder: &mut Rx4TrajectoryRecorder, event: &rx4::Event
                 response: None,
                 success: false,
             });
-        }
-        rx4::Event::MessageEnd {
-            role: Role::User,
-            content,
-        } => {
-            if let Some((action, source)) = infer_recovery_from_user_text(content) {
-                record_recovery_action(recorder, &action, source);
-            }
         }
         _ => {}
     }
@@ -421,6 +433,50 @@ pub fn record_recovery_action(
     });
 }
 
+pub fn record_recovery_kind(
+    recorder: &mut Rx4TrajectoryRecorder,
+    action: RecoveryKind,
+    reason: &str,
+) {
+    let (name, success) = match action {
+        RecoveryKind::Prefill => ("prefill", true),
+        RecoveryKind::Nudge => ("nudge", true),
+        RecoveryKind::Retry => ("retry", false),
+        RecoveryKind::Halt => ("halt", false),
+    };
+    recorder.steps.push(TrajectoryStep {
+        step: recorder.steps.len() + 1,
+        thought: None,
+        action: Some(name.to_string()),
+        action_args: None,
+        observation: (!reason.is_empty()).then(|| reason.to_string()),
+        response: None,
+        success,
+    });
+}
+
+pub fn record_tool_spill(
+    recorder: &mut Rx4TrajectoryRecorder,
+    status: SpillStatus,
+    locator: impl Into<String>,
+    original_bytes: usize,
+) {
+    let (args, success) = match status {
+        SpillStatus::Inline => ("inline", true),
+        SpillStatus::Spilled => ("spilled", true),
+        SpillStatus::SpillFailed => ("spill_failed", false),
+    };
+    recorder.steps.push(TrajectoryStep {
+        step: recorder.steps.len() + 1,
+        thought: None,
+        action: Some("spill".to_string()),
+        action_args: Some(format!("{args}:{original_bytes}")),
+        observation: Some(locator.into()),
+        response: None,
+        success,
+    });
+}
+
 pub fn record_spill_notice(recorder: &mut Rx4TrajectoryRecorder, locator: impl Into<String>) {
     recorder.steps.push(TrajectoryStep {
         step: recorder.steps.len() + 1,
@@ -468,17 +524,44 @@ pub fn record_rx4_event_value(recorder: &mut Rx4TrajectoryRecorder, value: &serd
             record_recovery_action(recorder, &parse_recovery_action_field(value), "stuck_tool");
         }
         "Recovery" => {
-            record_recovery_action(
-                recorder,
-                &parse_recovery_action_field(value),
-                recovery_source(value),
-            );
+            let reason = json_text(value, &["reason", "text", "message"]);
+            if let Some(kind) = value
+                .get("action")
+                .and_then(|v| v.as_str())
+                .and_then(recovery_kind_from_name)
+            {
+                record_recovery_kind(recorder, kind, &reason);
+            } else {
+                record_recovery_action(
+                    recorder,
+                    &parse_recovery_action_field(value),
+                    recovery_source(value),
+                );
+            }
         }
         "Spill" | "SpillNotice" | "ToolSpill" => {
-            record_spill_notice(
-                recorder,
-                json_text(value, &["locator", "path", "observation"]),
-            );
+            if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+                let status = match status {
+                    "inline" => SpillStatus::Inline,
+                    "spill_failed" => SpillStatus::SpillFailed,
+                    _ => SpillStatus::Spilled,
+                };
+                let original_bytes = value
+                    .get("original_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                record_tool_spill(
+                    recorder,
+                    status,
+                    json_text(value, &["locator", "path", "observation"]),
+                    original_bytes,
+                );
+            } else {
+                record_spill_notice(
+                    recorder,
+                    json_text(value, &["locator", "path", "observation"]),
+                );
+            }
         }
         "Failure" | "FailureNotice" | "ToolFailure" => {
             record_failure_notice(recorder, json_text(value, &["message", "reason", "error"]));
@@ -551,23 +634,14 @@ fn recovery_action_from_name(name: &str, text: String) -> RecoveryAction {
     }
 }
 
-fn infer_recovery_from_user_text(content: &str) -> Option<(RecoveryAction, &'static str)> {
-    if let RecoveryAction::Prefill(text) = recover_empty_turn(0, 3) {
-        if content == text {
-            return Some((RecoveryAction::Prefill(text), "empty_turn"));
-        }
+fn recovery_kind_from_name(name: &str) -> Option<RecoveryKind> {
+    match name {
+        "Prefill" | "prefill" => Some(RecoveryKind::Prefill),
+        "Nudge" | "nudge" => Some(RecoveryKind::Nudge),
+        "Retry" | "retry" => Some(RecoveryKind::Retry),
+        "Halt" | "halt" => Some(RecoveryKind::Halt),
+        _ => None,
     }
-    if let RecoveryAction::Nudge(text) = recover_empty_turn(1, 3) {
-        if content == text {
-            return Some((RecoveryAction::Nudge(text), "empty_turn"));
-        }
-    }
-    if let RecoveryAction::Nudge(text) = recover_stuck_tool(0, 3) {
-        if content == text {
-            return Some((RecoveryAction::Nudge(text), "stuck_tool"));
-        }
-    }
-    None
 }
 
 fn spill_locator(content: &str) -> Option<&str> {
@@ -837,6 +911,7 @@ pub fn register_apollo_tools(
                     content: result.output,
                     is_error: result.is_error,
                     error_kind: None,
+                    spill: None,
                 }
             })
         });
@@ -1499,6 +1574,7 @@ mod tests {
             content: "hello".into(),
             is_error: false,
             error_kind: None,
+            spill: None,
         }));
         recorder.on_event(&rx4::Event::GuardrailStop {
             tool: "exec".into(),
@@ -1543,13 +1619,13 @@ mod tests {
     #[test]
     fn recovery_actions_become_trajectory_steps() {
         let mut recorder = Rx4TrajectoryRecorder::default();
-        record_recovery_action(&mut recorder, &recover_empty_turn(0, 3), "empty_turn");
-        record_recovery_action(&mut recorder, &recover_empty_turn(1, 3), "empty_turn");
+        record_recovery_action(&mut recorder, &rx4::recover_empty_turn(0, 3), "empty_turn");
+        record_recovery_action(&mut recorder, &rx4::recover_empty_turn(1, 3), "empty_turn");
         record_recovery_action(&mut recorder, &RecoveryAction::Retry, "empty_turn");
-        record_recovery_action(&mut recorder, &recover_empty_turn(2, 3), "empty_turn");
-        record_recovery_action(&mut recorder, &recover_stuck_tool(0, 3), "stuck_tool");
+        record_recovery_action(&mut recorder, &rx4::recover_empty_turn(2, 3), "empty_turn");
+        record_recovery_action(&mut recorder, &rx4::recover_stuck_tool(0, 3), "stuck_tool");
         record_recovery_action(&mut recorder, &RecoveryAction::Retry, "stuck_tool");
-        record_recovery_action(&mut recorder, &recover_stuck_tool(2, 3), "stuck_tool");
+        record_recovery_action(&mut recorder, &rx4::recover_stuck_tool(2, 3), "stuck_tool");
         let (steps, _) = recorder.take_steps();
         let actions: Vec<_> = steps
             .iter()
@@ -1576,58 +1652,85 @@ mod tests {
     }
 
     #[test]
-    fn current_pin_recovery_signals_become_trajectory_steps() {
+    fn typed_recovery_spill_and_process_events_become_trajectory_steps() {
         let mut recorder = Rx4TrajectoryRecorder::default();
-        let prefill = match recover_empty_turn(0, 3) {
-            RecoveryAction::Prefill(text) => text,
-            other => panic!("expected prefill, got {other:?}"),
-        };
-        let nudge = match recover_empty_turn(1, 3) {
-            RecoveryAction::Nudge(text) => text,
-            other => panic!("expected nudge, got {other:?}"),
-        };
-        let stuck = match recover_stuck_tool(0, 3) {
-            RecoveryAction::Nudge(text) => text,
-            other => panic!("expected stuck nudge, got {other:?}"),
-        };
-        recorder.on_event(&rx4::Event::MessageEnd {
-            role: Role::User,
-            content: prefill,
+        recorder.on_event(&rx4::Event::Recovery {
+            action: RecoveryKind::Prefill,
+            reason: "Continue from where you left off.".into(),
         });
-        recorder.on_event(&rx4::Event::MessageEnd {
-            role: Role::User,
-            content: nudge,
+        recorder.on_event(&rx4::Event::Recovery {
+            action: RecoveryKind::Nudge,
+            reason: "Your last turn was empty.".into(),
         });
-        recorder.on_event(&rx4::Event::MessageEnd {
-            role: Role::User,
-            content: stuck,
+        recorder.on_event(&rx4::Event::Recovery {
+            action: RecoveryKind::Retry,
+            reason: String::new(),
         });
-        recorder.on_event(&rx4::Event::RetryReason {
-            retry_reason: "stuck_tool".into(),
-            layer: "tool".into(),
-        });
-        recorder.on_event(&rx4::Event::RetryReason {
-            retry_reason: "stuck tool repeated 2 times (halt after 3)".into(),
-            layer: "tool".into(),
-        });
-        recorder.on_event(&rx4::Event::GuardrailStop {
-            tool: "turn".into(),
+        recorder.on_event(&rx4::Event::Recovery {
+            action: RecoveryKind::Halt,
             reason: "empty turn limit reached (2/3)".into(),
+        });
+        recorder.on_event(&rx4::Event::ToolSpill {
+            status: SpillStatus::Spilled,
+            locator: "file://spill.txt".into(),
+            original_bytes: 20_000,
+        });
+        recorder.on_event(&rx4::Event::ToolSpill {
+            status: SpillStatus::SpillFailed,
+            locator: String::new(),
+            original_bytes: 20,
+        });
+        recorder.on_event(&rx4::Event::ProcessStart {
+            process_id: "p1".into(),
+            program: "cat".into(),
+        });
+        recorder.on_event(&rx4::Event::ProcessEnd {
+            process_id: "p1".into(),
+            exit_code: Some(0),
+        });
+        recorder.on_event(&rx4::Event::ProcessEnd {
+            process_id: "p2".into(),
+            exit_code: Some(1),
         });
         let (steps, _) = recorder.take_steps();
         let actions: Vec<_> = steps
             .iter()
-            .map(|step| (step.action.as_deref(), step.action_args.as_deref()))
+            .map(|step| {
+                (
+                    step.action.as_deref(),
+                    step.action_args.as_deref(),
+                    step.observation.as_deref(),
+                    step.success,
+                )
+            })
             .collect();
         assert_eq!(
             actions,
             [
-                (Some("prefill"), Some("empty_turn")),
-                (Some("nudge"), Some("empty_turn")),
-                (Some("stuck_tool"), Some("nudge")),
-                (Some("stuck_tool"), Some("retry")),
-                (Some("stuck_tool"), Some("halt")),
-                (Some("halt"), Some("empty_turn")),
+                (
+                    Some("prefill"),
+                    None,
+                    Some("Continue from where you left off."),
+                    true
+                ),
+                (Some("nudge"), None, Some("Your last turn was empty."), true),
+                (Some("retry"), None, None, false),
+                (
+                    Some("halt"),
+                    None,
+                    Some("empty turn limit reached (2/3)"),
+                    false
+                ),
+                (
+                    Some("spill"),
+                    Some("spilled:20000"),
+                    Some("file://spill.txt"),
+                    true
+                ),
+                (Some("spill"), Some("spill_failed:20"), Some(""), false),
+                (Some("process_start"), Some("p1"), Some("cat"), true),
+                (Some("process_end"), Some("p1"), Some("0"), true),
+                (Some("process_end"), Some("p2"), Some("1"), false),
             ]
         );
     }
@@ -1655,8 +1758,8 @@ mod tests {
             &mut recorder,
             &serde_json::json!({
                 "type": "Recovery",
-                "action": {"Halt": "empty turn limit reached"},
-                "source": "empty_turn"
+                "action": "halt",
+                "reason": "empty turn limit reached"
             }),
         );
         record_rx4_event_value(
@@ -1690,12 +1793,7 @@ mod tests {
                     true
                 ),
                 (Some("stuck_tool"), Some("nudge"), Some("change args"), true),
-                (
-                    Some("halt"),
-                    Some("empty_turn"),
-                    Some("empty turn limit reached"),
-                    false
-                ),
+                (Some("halt"), None, Some("empty turn limit reached"), false),
                 (Some("spill"), None, Some("file://spill.txt"), true),
                 (Some("failure"), None, Some("tool blew up"), false),
             ]

@@ -602,7 +602,7 @@ fn rx4_sandbox_escalate_records_retry_and_stays_fail_closed() {
 fn rx4_spilled_tool_result_records_a_spill_step() {
     let dir = tempfile::tempdir().unwrap();
     let body = "x".repeat(20_000);
-    let spilled = rx4::tools::spill::bound_tool_output(&body, 1024, dir.path()).unwrap();
+    let spilled = rx4::tools::spill::bound_tool_output(&body, 1024, dir.path());
     assert!(spilled.spilled);
     assert!(rx4::tools::spill::locator_is_file(&spilled.locator));
 
@@ -617,11 +617,20 @@ fn rx4_spilled_tool_result_records_a_spill_step() {
     );
     record_rx4_event(
         &mut recorder,
+        &rx4::Event::ToolSpill {
+            status: spilled.status,
+            locator: spilled.locator.clone(),
+            original_bytes: spilled.original_bytes,
+        },
+    );
+    record_rx4_event(
+        &mut recorder,
         &rx4::Event::ToolExecutionEnd(rx4::ToolResult {
             id: "c-spill".into(),
-            content: spilled.preview,
+            content: spilled.preview.clone(),
             is_error: false,
             error_kind: None,
+            spill: Some(spilled.notice()),
         }),
     );
     let (steps, _) = recorder.take_steps();
@@ -706,31 +715,42 @@ fn rx4_typed_notice_values_are_recorded_on_the_trajectory() {
 }
 
 #[test]
-fn rx4_current_pin_recovery_signals_are_recorded() {
+fn rx4_typed_recovery_spill_and_process_events_are_recorded() {
     let mut recorder = Rx4TrajectoryRecorder::default();
-    let prefill = match rx4::recover_empty_turn(0, 3) {
-        rx4::RecoveryAction::Prefill(text) => text,
-        other => panic!("expected prefill, got {other:?}"),
-    };
     record_rx4_event(
         &mut recorder,
-        &rx4::Event::MessageEnd {
-            role: rx4::Role::User,
-            content: prefill,
+        &rx4::Event::Recovery {
+            action: rx4::RecoveryKind::Prefill,
+            reason: "Continue from where you left off.".into(),
         },
     );
     record_rx4_event(
         &mut recorder,
-        &rx4::Event::RetryReason {
-            retry_reason: "stuck_tool".into(),
-            layer: "tool".into(),
+        &rx4::Event::Recovery {
+            action: rx4::RecoveryKind::Nudge,
+            reason: "change args".into(),
         },
     );
     record_rx4_event(
         &mut recorder,
-        &rx4::Event::GuardrailStop {
-            tool: "turn".into(),
-            reason: "empty turn limit reached (2/3)".into(),
+        &rx4::Event::ToolSpill {
+            status: rx4::SpillStatus::Spilled,
+            locator: ".rx4/spill/out.txt".into(),
+            original_bytes: 2048,
+        },
+    );
+    record_rx4_event(
+        &mut recorder,
+        &rx4::Event::ProcessStart {
+            process_id: "p1".into(),
+            program: "cat".into(),
+        },
+    );
+    record_rx4_event(
+        &mut recorder,
+        &rx4::Event::ProcessEnd {
+            process_id: "p1".into(),
+            exit_code: Some(0),
         },
     );
     let (steps, _) = recorder.take_steps();
@@ -738,5 +758,10 @@ fn rx4_current_pin_recovery_signals_are_recorded() {
         .iter()
         .filter_map(|step| step.action.as_deref())
         .collect();
-    assert_eq!(actions, ["prefill", "stuck_tool", "halt"]);
+    assert_eq!(
+        actions,
+        ["prefill", "nudge", "spill", "process_start", "process_end"]
+    );
+    assert_eq!(steps[2].action_args.as_deref(), Some("spilled:2048"));
+    assert_eq!(steps[2].observation.as_deref(), Some(".rx4/spill/out.txt"));
 }
